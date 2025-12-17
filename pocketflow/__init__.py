@@ -24,14 +24,21 @@ class _ConditionalTransition:
     def __rshift__(self,tgt): return self.src.next(tgt,self.action)
 
 class Node(BaseNode):
-    def __init__(self,max_retries=1,wait=0): super().__init__(); self.max_retries,self.wait=max_retries,wait
+    def __init__(self,max_retries=1,wait=0,exponential_backoff=False,max_wait=None): super().__init__(); self.max_retries,self.wait,self.exponential_backoff,self.max_wait=max_retries,wait,exponential_backoff,max_wait
     def exec_fallback(self,prep_res,exc): raise exc
+    def _get_wait_time(self,retry_count):
+        if self.wait<=0: return 0
+        w=self.wait*(2**retry_count) if self.exponential_backoff else self.wait
+        return min(w,self.max_wait) if self.max_wait is not None else w
     def _exec(self,prep_res):
-        for self.cur_retry in range(self.max_retries):
+        self.cur_retry=0
+        for i in range(self.max_retries):
+            self.cur_retry=i
             try: return self.exec(prep_res)
             except Exception as e:
-                if self.cur_retry==self.max_retries-1: return self.exec_fallback(prep_res,e)
-                if self.wait>0: time.sleep(self.wait)
+                if i==self.max_retries-1: return self.exec_fallback(prep_res,e)
+                w=self._get_wait_time(i)
+                if w>0: time.sleep(w)
 
 class BatchNode(Node):
     def _exec(self,items): return [super(BatchNode,self)._exec(i) for i in (items or [])]
@@ -61,12 +68,15 @@ class AsyncNode(Node):
     async def exec_async(self,prep_res): pass
     async def exec_fallback_async(self,prep_res,exc): raise exc
     async def post_async(self,shared,prep_res,exec_res): pass
-    async def _exec(self,prep_res): 
-        for self.cur_retry in range(self.max_retries):
+    async def _exec(self,prep_res):
+        self.cur_retry=0
+        for i in range(self.max_retries):
+            self.cur_retry=i
             try: return await self.exec_async(prep_res)
             except Exception as e:
-                if self.cur_retry==self.max_retries-1: return await self.exec_fallback_async(prep_res,e)
-                if self.wait>0: await asyncio.sleep(self.wait)
+                if i==self.max_retries-1: return await self.exec_fallback_async(prep_res,e)
+                w=self._get_wait_time(i)
+                if w>0: await asyncio.sleep(w)
     async def run_async(self,shared): 
         if self.successors: warnings.warn("Node won't run successors. Use AsyncFlow.")  
         return await self._run_async(shared)

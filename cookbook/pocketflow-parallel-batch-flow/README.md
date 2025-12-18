@@ -58,4 +58,15 @@ Processing complete! Check the output/ directory for results.
   - Good for: Rate-limited APIs, maintaining order
 
 - **Parallel**: Total time ≈ longest single item time
-  - Good for: I/O-bound tasks, independent operations 
+  - Good for: I/O-bound tasks, independent operations
+
+## Concurrency Limit
+
+To control resource usage or avoid overloading APIs, use the `concurrency_limit` parameter:
+
+```python
+# Limit to 3 concurrent operations
+flow = ImageProcessorFlow(start=sub_flow, concurrency_limit=3)
+```
+
+This ensures only a limited number of operations run simultaneously, preventing resource exhaustion while still benefiting from parallel execution. 

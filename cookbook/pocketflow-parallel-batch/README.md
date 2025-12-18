@@ -47,6 +47,11 @@ The implementation uses an `AsyncParallelBatchNode` that processes translation r
 
 This approach leverages `asyncio` and parallel execution to speed up I/O-bound tasks like multiple API calls.
 
+> **Tip**: To avoid API rate limits when processing many items, use `concurrency_limit` to control the maximum number of parallel executions:
+> ```python
+> node = TranslateTextNodeParallel(concurrency_limit=5)  # Max 5 concurrent API calls
+> ```
+
 ## Example Output & Comparison
 
 Running this parallel version significantly reduces the total time compared to a sequential approach:

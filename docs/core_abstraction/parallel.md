@@ -13,9 +13,9 @@ nav_order: 6
 {: .warning }
 
 > - **Ensure Tasks Are Independent**: If each item depends on the output of a previous item, **do not** parallelize.
-> 
-> - **Beware of Rate Limits**: Parallel calls can **quickly** trigger rate limits on LLM services. You may need a **throttling** mechanism (e.g., semaphores or sleep intervals).
-> 
+>
+> - **Beware of Rate Limits**: Parallel calls can **quickly** trigger rate limits on LLM services. Use the built-in `concurrency_limit` parameter to control max parallel executions.
+>
 > - **Consider Single-Node Batch APIs**: Some LLMs offer a **batch inference** API where you can send multiple prompts in a single call. This is more complex to implement but can be more efficient than launching many parallel requests and mitigates rate limits.
 {: .best-practice }
 
@@ -41,6 +41,17 @@ node = ParallelSummaries()
 flow = AsyncFlow(start=node)
 ```
 
+### Concurrency Limit
+
+To prevent resource overload or rate limiting, use `concurrency_limit` to control the maximum number of parallel executions:
+
+```python
+# Limit to 5 concurrent API calls
+node = ParallelSummaries(concurrency_limit=5)
+```
+
+When `concurrency_limit` is set, only that many `exec_async()` calls will run simultaneously. The rest will wait until a slot becomes available. If not set, all items are processed in parallel without limit.
+
 ## AsyncParallelBatchFlow
 
 Parallel version of **BatchFlow**. Each iteration of the sub-flow runs **concurrently** using different parameters:
@@ -54,3 +65,14 @@ sub_flow = AsyncFlow(start=LoadAndSummarizeFile())
 parallel_flow = SummarizeMultipleFiles(start=sub_flow)
 await parallel_flow.run_async(shared)
 ```
+
+### Concurrency Limit
+
+Like `AsyncParallelBatchNode`, you can limit the number of concurrent flow executions:
+
+```python
+# Process at most 3 files concurrently
+parallel_flow = SummarizeMultipleFiles(start=sub_flow, concurrency_limit=3)
+```
+
+This is especially useful when each sub-flow makes API calls that might hit rate limits, or when processing many items that could exhaust system resources.

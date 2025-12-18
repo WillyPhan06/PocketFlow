@@ -82,9 +82,28 @@ class AsyncBatchNode(AsyncNode[Optional[List[_PrepResult]], List[_ExecResult], _
     async def _exec(self, items: Optional[List[_PrepResult]]) -> List[_ExecResult]: ...
 
 class AsyncParallelBatchNode(AsyncNode[Optional[List[_PrepResult]], List[_ExecResult], _PostResult], BatchNode[Optional[List[_PrepResult]], List[_ExecResult], _PostResult]):
+    concurrency_limit: Optional[int]
+    _semaphore: Optional[asyncio.Semaphore]
+
+    def __init__(
+        self,
+        max_retries: int = 1,
+        wait: Union[int, float] = 0,
+        exponential_backoff: bool = False,
+        max_wait: Optional[Union[int, float]] = None,
+        concurrency_limit: Optional[int] = None
+    ) -> None: ...
     async def _exec(self, items: Optional[List[_PrepResult]]) -> List[_ExecResult]: ...
 
 class AsyncFlow(Flow[_PrepResult, Any, _PostResult], AsyncNode[_PrepResult, Any, _PostResult]):
+    concurrency_limit: Optional[int]
+    _semaphore: Optional[asyncio.Semaphore]
+
+    def __init__(
+        self,
+        start: Optional[BaseNode[Any, Any, Any]] = None,
+        concurrency_limit: Optional[int] = None
+    ) -> None: ...
     async def _orch_async(
         self, shared: SharedData, params: Optional[Params] = None
     ) -> Any: ...

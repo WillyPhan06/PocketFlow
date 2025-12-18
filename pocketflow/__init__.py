@@ -87,9 +87,22 @@ class AsyncBatchNode(AsyncNode,BatchNode):
     async def _exec(self,items): return [await super(AsyncBatchNode,self)._exec(i) for i in items]
 
 class AsyncParallelBatchNode(AsyncNode,BatchNode):
-    async def _exec(self,items): return await asyncio.gather(*(super(AsyncParallelBatchNode,self)._exec(i) for i in items))
+    def __init__(self,max_retries=1,wait=0,exponential_backoff=False,max_wait=None,concurrency_limit=None):
+        super().__init__(max_retries,wait,exponential_backoff,max_wait)
+        if concurrency_limit is not None and concurrency_limit<1: raise ValueError("concurrency_limit must be at least 1")
+        self.concurrency_limit=concurrency_limit; self._semaphore=asyncio.Semaphore(concurrency_limit) if concurrency_limit else None
+    async def _exec(self,items):
+        if self._semaphore:
+            async def limited_exec(i):
+                async with self._semaphore: return await super(AsyncParallelBatchNode,self)._exec(i)
+            return await asyncio.gather(*(limited_exec(i) for i in items))
+        return await asyncio.gather(*(super(AsyncParallelBatchNode,self)._exec(i) for i in items))
 
 class AsyncFlow(Flow,AsyncNode):
+    def __init__(self,start=None,concurrency_limit=None):
+        super().__init__(start)
+        if concurrency_limit is not None and concurrency_limit<1: raise ValueError("concurrency_limit must be at least 1")
+        self.concurrency_limit=concurrency_limit; self._semaphore=asyncio.Semaphore(concurrency_limit) if concurrency_limit else None
     async def _orch_async(self,shared,params=None):
         curr,p,last_action =copy.copy(self.start_node),(params or {**self.params}),None
         while curr: curr.set_params(p); last_action=await curr._run_async(shared) if isinstance(curr,AsyncNode) else curr._run(shared); curr=copy.copy(self.get_next_node(curr,last_action))
@@ -104,7 +117,11 @@ class AsyncBatchFlow(AsyncFlow,BatchFlow):
         return await self.post_async(shared,pr,None)
 
 class AsyncParallelBatchFlow(AsyncFlow,BatchFlow):
-    async def _run_async(self,shared): 
+    async def _run_async(self,shared):
         pr=await self.prep_async(shared) or []
-        await asyncio.gather(*(self._orch_async(shared,{**self.params,**bp}) for bp in pr))
+        if self._semaphore:
+            async def limited_orch(bp):
+                async with self._semaphore: return await self._orch_async(shared,{**self.params,**bp})
+            await asyncio.gather(*(limited_orch(bp) for bp in pr))
+        else: await asyncio.gather(*(self._orch_async(shared,{**self.params,**bp}) for bp in pr))
         return await self.post_async(shared,pr,None)

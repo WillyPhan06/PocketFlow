@@ -84,6 +84,8 @@ class AsyncBatchNode(AsyncNode[Optional[List[_PrepResult]], List[_ExecResult], _
 class AsyncParallelBatchNode(AsyncNode[Optional[List[_PrepResult]], List[_ExecResult], _PostResult], BatchNode[Optional[List[_PrepResult]], List[_ExecResult], _PostResult]):
     concurrency_limit: Optional[int]
     _semaphore: Optional[asyncio.Semaphore]
+    _concurrent_task_count: int
+    _concurrent_task_lock: asyncio.Lock
 
     def __init__(
         self,
@@ -93,6 +95,7 @@ class AsyncParallelBatchNode(AsyncNode[Optional[List[_PrepResult]], List[_ExecRe
         max_wait: Optional[Union[int, float]] = None,
         concurrency_limit: Optional[int] = None
     ) -> None: ...
+    def get_concurrent_task_count(self) -> int: ...
     async def _exec(self, items: Optional[List[_PrepResult]]) -> List[_ExecResult]: ...
 
 class AsyncFlow(Flow[_PrepResult, Any, _PostResult], AsyncNode[_PrepResult, Any, _PostResult]):
@@ -116,4 +119,13 @@ class AsyncBatchFlow(AsyncFlow[Optional[List[Params]], Any, _PostResult], BatchF
     async def _run_async(self, shared: SharedData) -> _PostResult: ...
 
 class AsyncParallelBatchFlow(AsyncFlow[Optional[List[Params]], Any, _PostResult], BatchFlow[Optional[List[Params]], Any, _PostResult]):
+    _concurrent_task_count: int
+    _concurrent_task_lock: asyncio.Lock
+
+    def __init__(
+        self,
+        start: Optional[BaseNode[Any, Any, Any]] = None,
+        concurrency_limit: Optional[int] = None
+    ) -> None: ...
+    def get_concurrent_task_count(self) -> int: ...
     async def _run_async(self, shared: SharedData) -> _PostResult: ...

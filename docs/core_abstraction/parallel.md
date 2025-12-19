@@ -52,6 +52,27 @@ node = ParallelSummaries(concurrency_limit=5)
 
 When `concurrency_limit` is set, only that many `exec_async()` calls will run simultaneously. The rest will wait until a slot becomes available. If not set, all items are processed in parallel without limit.
 
+### Monitoring Concurrent Tasks
+
+Use `get_concurrent_task_count()` to check how many tasks are currently executing. This is useful for debugging, logging, or building custom monitoring:
+
+```python
+class MonitoredSummaries(AsyncParallelBatchNode):
+    def __init__(self):
+        super().__init__(concurrency_limit=5)
+
+    async def exec_async(self, text):
+        # Log current concurrency for debugging
+        print(f"Active tasks: {self.get_concurrent_task_count()}/5")
+        return await call_llm_async(f"Summarize: {text}")
+
+# The count is 0 before and after execution
+node = MonitoredSummaries()
+print(node.get_concurrent_task_count())  # 0
+await node.run_async(shared)
+print(node.get_concurrent_task_count())  # 0
+```
+
 ## AsyncParallelBatchFlow
 
 Parallel version of **BatchFlow**. Each iteration of the sub-flow runs **concurrently** using different parameters:
@@ -76,3 +97,22 @@ parallel_flow = SummarizeMultipleFiles(start=sub_flow, concurrency_limit=3)
 ```
 
 This is especially useful when each sub-flow makes API calls that might hit rate limits, or when processing many items that could exhaust system resources.
+
+### Monitoring Concurrent Tasks
+
+Use `get_concurrent_task_count()` to monitor how many sub-flows are currently running:
+
+```python
+parallel_flow = SummarizeMultipleFiles(start=sub_flow, concurrency_limit=3)
+
+# Inside a node, you can check the parent flow's concurrency
+class LoadAndSummarizeFile(AsyncNode):
+    def __init__(self, parent_flow):
+        super().__init__()
+        self.parent_flow = parent_flow
+
+    async def exec_async(self, prep_res):
+        # Monitor parent flow's concurrent executions
+        print(f"Concurrent flows: {self.parent_flow.get_concurrent_task_count()}")
+        return await process_file(prep_res)
+```

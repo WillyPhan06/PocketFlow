@@ -385,5 +385,200 @@ class TestAsyncParallelBatchNodeConcurrencyLimit(unittest.TestCase):
         self.assertGreater(elapsed, 0.25)
 
 
+class TestGetConcurrentTaskCount(unittest.TestCase):
+    """Test get_concurrent_task_count() method for monitoring concurrent execution."""
+
+    def test_parallel_batch_node_get_concurrent_task_count_during_execution(self):
+        """Test that get_concurrent_task_count() returns correct count during execution."""
+        async def run_test():
+            observed_counts = []
+
+            class TestNode(AsyncParallelBatchNode):
+                def __init__(self):
+                    super().__init__(concurrency_limit=3)
+
+                async def prep_async(self, shared):
+                    return shared['items']
+
+                async def exec_async(self, item):
+                    # Record the concurrent task count at the start of each task
+                    observed_counts.append(self.get_concurrent_task_count())
+                    await asyncio.sleep(0.1)
+                    return item * 2
+
+                async def post_async(self, shared, prep_res, exec_res):
+                    shared['results'] = exec_res
+                    return "done"
+
+            node = TestNode()
+            shared = {'items': [1, 2, 3, 4, 5]}
+            await node.run_async(shared)
+
+            return shared, observed_counts, node.get_concurrent_task_count()
+
+        shared, observed_counts, final_count = asyncio.run(run_test())
+        self.assertEqual(shared['results'], [2, 4, 6, 8, 10])
+        # After completion, concurrent task count should be 0
+        self.assertEqual(final_count, 0)
+        # At least one observation should show 3 concurrent (the limit)
+        self.assertIn(3, observed_counts)
+        # No observation should exceed the limit of 3
+        self.assertTrue(all(c <= 3 for c in observed_counts))
+
+    def test_parallel_batch_node_get_concurrent_task_count_without_limit(self):
+        """Test get_concurrent_task_count() works correctly without concurrency limit."""
+        async def run_test():
+            observed_counts = []
+
+            class TestNode(AsyncParallelBatchNode):
+                async def prep_async(self, shared):
+                    return shared['items']
+
+                async def exec_async(self, item):
+                    observed_counts.append(self.get_concurrent_task_count())
+                    await asyncio.sleep(0.1)
+                    return item * 2
+
+                async def post_async(self, shared, prep_res, exec_res):
+                    shared['results'] = exec_res
+                    return "done"
+
+            node = TestNode()  # No concurrency limit
+            shared = {'items': [1, 2, 3, 4, 5]}
+            await node.run_async(shared)
+
+            return shared, observed_counts, node.get_concurrent_task_count()
+
+        shared, observed_counts, final_count = asyncio.run(run_test())
+        self.assertEqual(shared['results'], [2, 4, 6, 8, 10])
+        # After completion, concurrent task count should be 0
+        self.assertEqual(final_count, 0)
+        # Without limit, all 5 should be running at once
+        self.assertIn(5, observed_counts)
+
+    def test_parallel_batch_flow_get_concurrent_task_count_during_execution(self):
+        """Test that get_concurrent_task_count() returns correct count for AsyncParallelBatchFlow."""
+        async def run_test():
+            observed_counts = []
+
+            class TestParallelBatchFlow(AsyncParallelBatchFlow):
+                async def prep_async(self, shared):
+                    return [{'batch_id': i} for i in range(5)]
+
+            class ObservingNode(AsyncNode):
+                def __init__(self, flow_ref):
+                    super().__init__()
+                    self.flow_ref = flow_ref
+
+                async def prep_async(self, shared):
+                    return self.params.get('batch_id', 0)
+
+                async def exec_async(self, prep_res):
+                    # Record the flow's concurrent task count
+                    observed_counts.append(self.flow_ref.get_concurrent_task_count())
+                    await asyncio.sleep(0.1)
+                    return prep_res
+
+                async def post_async(self, shared, prep_res, exec_res):
+                    if 'results' not in shared:
+                        shared['results'] = []
+                    shared['results'].append(exec_res)
+                    return "done"
+
+            flow = TestParallelBatchFlow(concurrency_limit=2)
+            node = ObservingNode(flow)
+            flow.start_node = node
+            shared = {}
+            await flow.run_async(shared)
+
+            return shared, observed_counts, flow.get_concurrent_task_count()
+
+        shared, observed_counts, final_count = asyncio.run(run_test())
+        self.assertEqual(len(shared['results']), 5)
+        # After completion, concurrent task count should be 0
+        self.assertEqual(final_count, 0)
+        # At least one observation should show 2 concurrent (the limit)
+        self.assertIn(2, observed_counts)
+        # No observation should exceed the limit of 2
+        self.assertTrue(all(c <= 2 for c in observed_counts))
+
+    def test_parallel_batch_flow_get_concurrent_task_count_without_limit(self):
+        """Test get_concurrent_task_count() for AsyncParallelBatchFlow without limit."""
+        async def run_test():
+            observed_counts = []
+
+            class TestParallelBatchFlow(AsyncParallelBatchFlow):
+                async def prep_async(self, shared):
+                    return [{'batch_id': i} for i in range(4)]
+
+            class ObservingNode(AsyncNode):
+                def __init__(self, flow_ref):
+                    super().__init__()
+                    self.flow_ref = flow_ref
+
+                async def prep_async(self, shared):
+                    return self.params.get('batch_id', 0)
+
+                async def exec_async(self, prep_res):
+                    observed_counts.append(self.flow_ref.get_concurrent_task_count())
+                    await asyncio.sleep(0.1)
+                    return prep_res
+
+                async def post_async(self, shared, prep_res, exec_res):
+                    if 'results' not in shared:
+                        shared['results'] = []
+                    shared['results'].append(exec_res)
+                    return "done"
+
+            flow = TestParallelBatchFlow()  # No concurrency limit
+            node = ObservingNode(flow)
+            flow.start_node = node
+            shared = {}
+            await flow.run_async(shared)
+
+            return shared, observed_counts, flow.get_concurrent_task_count()
+
+        shared, observed_counts, final_count = asyncio.run(run_test())
+        self.assertEqual(len(shared['results']), 4)
+        # After completion, concurrent task count should be 0
+        self.assertEqual(final_count, 0)
+        # Without limit, all 4 should be running at once
+        self.assertIn(4, observed_counts)
+
+    def test_get_concurrent_task_count_is_zero_before_and_after_execution(self):
+        """Test that get_concurrent_task_count() is 0 before and after execution."""
+        async def run_test():
+            class TestNode(AsyncParallelBatchNode):
+                def __init__(self):
+                    super().__init__(concurrency_limit=2)
+
+                async def prep_async(self, shared):
+                    return shared['items']
+
+                async def exec_async(self, item):
+                    await asyncio.sleep(0.01)
+                    return item * 2
+
+                async def post_async(self, shared, prep_res, exec_res):
+                    shared['results'] = exec_res
+                    return "done"
+
+            node = TestNode()
+            # Check before execution
+            before_count = node.get_concurrent_task_count()
+
+            shared = {'items': [1, 2, 3]}
+            await node.run_async(shared)
+
+            # Check after execution
+            after_count = node.get_concurrent_task_count()
+
+            return before_count, after_count
+
+        before_count, after_count = asyncio.run(run_test())
+        self.assertEqual(before_count, 0)
+        self.assertEqual(after_count, 0)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -91,12 +91,18 @@ class AsyncParallelBatchNode(AsyncNode,BatchNode):
         super().__init__(max_retries,wait,exponential_backoff,max_wait)
         if concurrency_limit is not None and concurrency_limit<1: raise ValueError("concurrency_limit must be at least 1")
         self.concurrency_limit=concurrency_limit; self._semaphore=asyncio.Semaphore(concurrency_limit) if concurrency_limit else None
+        self._concurrent_task_count=0; self._concurrent_task_lock=asyncio.Lock()
+    def get_concurrent_task_count(self): return self._concurrent_task_count
     async def _exec(self,items):
-        if self._semaphore:
-            async def limited_exec(i):
-                async with self._semaphore: return await super(AsyncParallelBatchNode,self)._exec(i)
-            return await asyncio.gather(*(limited_exec(i) for i in items))
-        return await asyncio.gather(*(super(AsyncParallelBatchNode,self)._exec(i) for i in items))
+        async def tracked_exec(i,use_semaphore=False):
+            if use_semaphore: await self._semaphore.acquire()
+            async with self._concurrent_task_lock: self._concurrent_task_count+=1
+            try: return await super(AsyncParallelBatchNode,self)._exec(i)
+            finally:
+                async with self._concurrent_task_lock: self._concurrent_task_count-=1
+                if use_semaphore: self._semaphore.release()
+        if self._semaphore: return await asyncio.gather(*(tracked_exec(i,True) for i in items))
+        return await asyncio.gather(*(tracked_exec(i) for i in items))
 
 class AsyncFlow(Flow,AsyncNode):
     def __init__(self,start=None,concurrency_limit=None):
@@ -117,11 +123,19 @@ class AsyncBatchFlow(AsyncFlow,BatchFlow):
         return await self.post_async(shared,pr,None)
 
 class AsyncParallelBatchFlow(AsyncFlow,BatchFlow):
+    def __init__(self,start=None,concurrency_limit=None):
+        super().__init__(start,concurrency_limit)
+        self._concurrent_task_count=0; self._concurrent_task_lock=asyncio.Lock()
+    def get_concurrent_task_count(self): return self._concurrent_task_count
     async def _run_async(self,shared):
         pr=await self.prep_async(shared) or []
-        if self._semaphore:
-            async def limited_orch(bp):
-                async with self._semaphore: return await self._orch_async(shared,{**self.params,**bp})
-            await asyncio.gather(*(limited_orch(bp) for bp in pr))
-        else: await asyncio.gather(*(self._orch_async(shared,{**self.params,**bp}) for bp in pr))
+        async def tracked_orch(bp,use_semaphore=False):
+            if use_semaphore: await self._semaphore.acquire()
+            async with self._concurrent_task_lock: self._concurrent_task_count+=1
+            try: return await self._orch_async(shared,{**self.params,**bp})
+            finally:
+                async with self._concurrent_task_lock: self._concurrent_task_count-=1
+                if use_semaphore: self._semaphore.release()
+        if self._semaphore: await asyncio.gather(*(tracked_orch(bp,True) for bp in pr))
+        else: await asyncio.gather(*(tracked_orch(bp) for bp in pr))
         return await self.post_async(shared,pr,None)

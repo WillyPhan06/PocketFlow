@@ -135,8 +135,9 @@ Agentic Coding should be a collaboration between Human System Design and Agent I
      > <div align="center"><img src="https://github.com/the-pocket/.github/raw/main/assets/success.png?raw=true" width="400"/></div>
      {: .best-practice }
 
-8. **Reliability**  
+8. **Reliability**
    - **Node Retries**: Add checks in the node `exec` to ensure outputs meet requirements, and consider increasing `max_retries` and `wait` times.
+   - **Flow Tracing**: Use [FlowTracer](./core_abstraction/tracing.md) to debug complex flows—see which nodes ran, what data was passed, and why branches were taken.
    - **Logging and Visualization**: Maintain logs of all attempts and visualize node results for easier debugging.
    - **Self-Evaluation**: Add a separate node (powered by an LLM) to review outputs when results are uncertain.
 

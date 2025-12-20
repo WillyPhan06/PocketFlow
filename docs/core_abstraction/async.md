@@ -53,3 +53,18 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### Debugging Async Flows
+
+Use [FlowTracer](./tracing.md) to debug async flows—it's async-safe and works with concurrent flows:
+
+```python
+from pocketflow import FlowTracer
+
+async def main():
+    tracer = FlowTracer()
+    await flow.run_async(shared, tracer=tracer)
+    tracer.print_summary()
+```
+
+When running multiple async flows in parallel, each tracer remains isolated to its own flow. See [Tracing](./tracing.md) for details.

@@ -83,14 +83,30 @@ flowchart TD
 
 ### Running Individual Nodes vs. Running a Flow
 
-- `node.run(shared)`: Just runs that node alone (calls `prep->exec->post()`), returns an Action. 
+- `node.run(shared)`: Just runs that node alone (calls `prep->exec->post()`), returns an Action.
 - `flow.run(shared)`: Executes from the start node, follows Actions to the next node, and so on until the flow can't continue.
 
 > `node.run(shared)` **does not** proceed to the successor.
 > This is mainly for debugging or testing a single node.
-> 
+>
 > Always use `flow.run(...)` in production to ensure the full pipeline runs correctly.
 {: .warning }
+
+### Debugging with Flow Tracing
+
+For complex flows, use [FlowTracer](./tracing.md) to see exactly what happened:
+
+```python
+from pocketflow import FlowTracer
+
+tracer = FlowTracer()
+flow.run(shared, tracer=tracer)
+
+# See execution order and branching decisions
+tracer.print_summary()
+```
+
+This shows which nodes ran, which branches were taken, and any retries that occurred. See [Tracing](./tracing.md) for more details.
 
 ## 3. Nested Flows
 

@@ -254,7 +254,7 @@ class Node(BaseNode):
                 if w>0: time.sleep(w)
 
 class BatchNode(Node):
-    def _exec(self,items,tracer=None): return [super(BatchNode,self)._exec(i,tracer) for i in (items or [])]
+    def _exec(self,items,tracer=None): return [super(BatchNode,self)._exec(copy.deepcopy(i),tracer) for i in (items or [])]
 
 class Flow(BaseNode):
     def __init__(self,start=None): super().__init__(); self.start_node=start
@@ -301,9 +301,77 @@ class Flow(BaseNode):
     def post(self,shared,prep_res,exec_res): return exec_res
 
 class BatchFlow(Flow):
+    @staticmethod
+    def _deep_merge(target,source,original):
+        """
+        Merge changes from source into target, using original as the baseline reference.
+
+        WHY THIS EXISTS:
+        In batch processing, each iteration runs with an isolated copy of shared state to prevent
+        cross-iteration pollution. However, we still need to accumulate results back into the
+        original shared dict. This function intelligently merges only the CHANGES made by each
+        iteration, not the entire state.
+
+        WHY COMPARE AGAINST ORIGINAL:
+        We compare against 'original' (the state before ANY iteration ran) to detect what each
+        iteration actually changed. Without this comparison, we couldn't distinguish between:
+        - A value that was already there (shouldn't overwrite accumulated results)
+        - A value that this iteration explicitly set (should be merged)
+
+        Args:
+            target: The shared dict accumulating results from all iterations
+            source: The shared_copy from one iteration (contains that iteration's changes)
+            original: Snapshot of shared state before any iteration ran (the baseline)
+        """
+        for k,v in source.items():
+            orig_v=original.get(k) if original else None
+
+            if k not in target:
+                # WHY: Key didn't exist before - this iteration created it, so add it.
+                # This handles new results that iterations produce.
+                target[k]=copy.deepcopy(v)
+
+            elif isinstance(target[k],dict) and isinstance(v,dict):
+                # WHY RECURSE FOR DICTS: Dicts often hold results keyed by iteration ID
+                # (e.g., shared['results'][batch_id] = value). We need to merge nested keys
+                # from each iteration rather than replacing the entire dict, otherwise
+                # iteration 2's results would overwrite iteration 1's results.
+                orig_dict=orig_v if isinstance(orig_v,dict) else None
+                BatchFlow._deep_merge(target[k],v,orig_dict)
+
+            elif isinstance(target[k],list) and isinstance(v,list):
+                # WHY EXTEND FOR LISTS: Lists are commonly used to accumulate results
+                # (e.g., shared['results'].append(value)). Each iteration starts with the
+                # original list and appends its own items. We only want to add the NEW items
+                # that this iteration appended, not duplicate items from the original.
+                #
+                # HOW: If original had [a,b] and source now has [a,b,c,d], we only add [c,d]
+                # to target. This preserves items added by previous iterations while adding
+                # this iteration's contributions.
+                orig_list=orig_v if isinstance(orig_v,list) else []
+                new_items=v[len(orig_list):]
+                target[k].extend(copy.deepcopy(new_items))
+
+            elif v!=orig_v:
+                # WHY CHECK v!=orig_v: Only update if this iteration actually changed the value.
+                # If v equals orig_v, it means this iteration didn't modify it - the value is
+                # just carried over from the original state. We skip it to avoid overwriting
+                # changes made by previous iterations.
+                #
+                # NOTE ON TYPE CHANGES: If a value changes type between iterations (e.g., from
+                # int to dict), this branch handles it by replacement. The dict/list special
+                # cases above only apply when BOTH target and source have the same type.
+                # Type changes are treated as simple value updates.
+                target[k]=copy.deepcopy(v)
     def _run(self,shared,tracer=None):
         pr=self.prep(shared) or []
-        for bp in pr: self._orch(shared,{**self.params,**bp},tracer)
+        original_shared=copy.deepcopy(shared)  # Snapshot original state
+        for bp in pr:
+            shared_copy=copy.deepcopy(original_shared)  # Each iteration starts from original
+            params_copy=copy.deepcopy({**self.params,**bp})
+            self._orch(shared_copy,params_copy,tracer)
+            # Merge only changes from shared_copy into shared
+            BatchFlow._deep_merge(shared,shared_copy,original_shared)
         return self.post(shared,pr,None)
 
 class AsyncNode(Node):
@@ -350,7 +418,7 @@ class AsyncNode(Node):
     def _run(self,shared,tracer=None): raise RuntimeError("Use run_async.")
 
 class AsyncBatchNode(AsyncNode,BatchNode):
-    async def _exec(self,items,tracer=None): return [await super(AsyncBatchNode,self)._exec(i,tracer) for i in items]
+    async def _exec(self,items,tracer=None): return [await super(AsyncBatchNode,self)._exec(copy.deepcopy(i),tracer) for i in (items or [])]
 
 class AsyncParallelBatchNode(AsyncNode,BatchNode):
     def __init__(self,max_retries=1,wait=0,exponential_backoff=False,max_wait=None,concurrency_limit=None):
@@ -363,12 +431,12 @@ class AsyncParallelBatchNode(AsyncNode,BatchNode):
         async def tracked_exec(i,use_semaphore=False):
             if use_semaphore: await self._semaphore.acquire()
             async with self._concurrent_task_lock: self._concurrent_task_count+=1
-            try: return await super(AsyncParallelBatchNode,self)._exec(i,tracer)
+            try: return await super(AsyncParallelBatchNode,self)._exec(copy.deepcopy(i),tracer)
             finally:
                 async with self._concurrent_task_lock: self._concurrent_task_count-=1
                 if use_semaphore: self._semaphore.release()
-        if self._semaphore: return await asyncio.gather(*(tracked_exec(i,True) for i in items))
-        return await asyncio.gather(*(tracked_exec(i) for i in items))
+        if self._semaphore: return await asyncio.gather(*(tracked_exec(i,True) for i in (items or [])))
+        return await asyncio.gather(*(tracked_exec(i) for i in (items or [])))
 
 class AsyncFlow(Flow,AsyncNode):
     def __init__(self,start=None,concurrency_limit=None):
@@ -415,7 +483,13 @@ class AsyncFlow(Flow,AsyncNode):
 class AsyncBatchFlow(AsyncFlow,BatchFlow):
     async def _run_async(self,shared,tracer=None):
         pr=await self.prep_async(shared) or []
-        for bp in pr: await self._orch_async(shared,{**self.params,**bp},tracer)
+        original_shared=copy.deepcopy(shared)  # Snapshot original state
+        for bp in pr:
+            shared_copy=copy.deepcopy(original_shared)  # Each iteration starts from original
+            params_copy=copy.deepcopy({**self.params,**bp})
+            await self._orch_async(shared_copy,params_copy,tracer)
+            # Merge only changes from shared_copy into shared
+            BatchFlow._deep_merge(shared,shared_copy,original_shared)
         return await self.post_async(shared,pr,None)
 
 class AsyncParallelBatchFlow(AsyncFlow,BatchFlow):
@@ -425,13 +499,21 @@ class AsyncParallelBatchFlow(AsyncFlow,BatchFlow):
     def get_concurrent_task_count(self): return self._concurrent_task_count
     async def _run_async(self,shared,tracer=None):
         pr=await self.prep_async(shared) or []
-        async def tracked_orch(bp,use_semaphore=False):
+        original_shared=copy.deepcopy(shared)  # Snapshot original state
+        async def tracked_orch(bp,idx,use_semaphore=False):
             if use_semaphore: await self._semaphore.acquire()
             async with self._concurrent_task_lock: self._concurrent_task_count+=1
-            try: return await self._orch_async(shared,{**self.params,**bp},tracer)
+            try:
+                shared_copy=copy.deepcopy(original_shared)  # Each task starts from original
+                params_copy=copy.deepcopy({**self.params,**bp})
+                await self._orch_async(shared_copy,params_copy,tracer)
+                return (idx,shared_copy)  # Return index and modified shared copy
             finally:
                 async with self._concurrent_task_lock: self._concurrent_task_count-=1
                 if use_semaphore: self._semaphore.release()
-        if self._semaphore: await asyncio.gather(*(tracked_orch(bp,True) for bp in pr))
-        else: await asyncio.gather(*(tracked_orch(bp) for bp in pr))
+        if self._semaphore: results=await asyncio.gather(*(tracked_orch(bp,i,True) for i,bp in enumerate(pr)))
+        else: results=await asyncio.gather(*(tracked_orch(bp,i) for i,bp in enumerate(pr)))
+        # Sort by index to ensure deterministic merge order
+        for idx,shared_copy in sorted(results,key=lambda x:x[0]):
+            BatchFlow._deep_merge(shared,shared_copy,original_shared)
         return await self.post_async(shared,pr,None)

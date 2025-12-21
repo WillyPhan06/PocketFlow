@@ -175,3 +175,109 @@ outer_flow = DirectoryBatchFlow(start=inner_flow)
 # Run it
 outer_flow.run(shared)
 ```
+
+---
+
+## 4. Batch State Isolation
+
+When processing multiple items in batch, each iteration runs with **isolated state** to prevent cross-iteration pollution. This ensures that modifications made during one iteration don't accidentally affect other iterations.
+
+### Why Isolation Matters
+
+Without isolation, batch processing can produce incorrect results:
+
+```python
+# Problem: Without isolation, iterations can interfere with each other
+class ProcessItem(Node):
+    def prep(self, shared):
+        # Each iteration expects to see the original counter value
+        return shared.get("counter", 0)
+
+    def post(self, shared, prep_res, exec_res):
+        # This modification would affect subsequent iterations without isolation!
+        shared["counter"] = shared.get("counter", 0) + 1
+        return "default"
+```
+
+With state isolation, each iteration starts with a **copy of the original shared state**, so the counter modification in iteration 1 doesn't affect iteration 2's `prep()`.
+
+### How Isolation Works
+
+1. **Before batch starts**: A snapshot of the original `shared` state is taken.
+2. **Each iteration**: Receives a deep copy of the original state (not the modified state from previous iterations).
+3. **After each iteration**: Changes are intelligently merged back into the main `shared` dict.
+
+### Storing Results with Isolation
+
+Since each iteration starts fresh, use **unique keys** to accumulate results:
+
+```python
+class ProcessFile(Node):
+    def post(self, shared, prep_res, exec_res):
+        filename = self.params["filename"]
+
+        # Good: Use unique keys per iteration
+        if "results" not in shared:
+            shared["results"] = {}
+        shared["results"][filename] = exec_res  # Each iteration writes to a different key
+
+        return "default"
+```
+
+Results can also be accumulated in lists:
+
+```python
+class CollectResults(Node):
+    def post(self, shared, prep_res, exec_res):
+        # Good: Appending to lists works correctly
+        if "all_results" not in shared:
+            shared["all_results"] = []
+        shared["all_results"].append(exec_res)  # Items are merged in iteration order
+
+        return "default"
+```
+
+### Parallel Batch Execution
+
+For `AsyncParallelBatchFlow`, isolation is especially important since multiple iterations run **concurrently**. Without isolation, concurrent modifications would cause race conditions.
+
+```python
+class ParallelProcessor(AsyncParallelBatchFlow):
+    async def prep_async(self, shared):
+        return [{"task_id": i} for i in range(10)]
+
+class ProcessTask(AsyncNode):
+    async def post_async(self, shared, prep_res, exec_res):
+        task_id = self.params["task_id"]
+
+        # Safe: Each parallel task writes to its own key
+        if "results" not in shared:
+            shared["results"] = {}
+        shared["results"][task_id] = exec_res
+
+        return "done"
+```
+
+Results from parallel execution are merged in **batch index order** (not completion order), ensuring deterministic output regardless of which tasks finish first.
+
+### Params Isolation
+
+Parameters (`self.params`) are also deep-copied for each iteration, preventing mutations in one iteration from affecting others:
+
+```python
+class SafeNode(Node):
+    def exec(self, prep_res):
+        # Even if you modify params, other iterations won't be affected
+        self.params["data"].append("modified")  # Safe - won't affect other iterations
+        return prep_res
+```
+
+### Summary
+
+| What | Behavior |
+|------|----------|
+| `shared` dict | Deep-copied per iteration; changes merged back |
+| `self.params` | Deep-copied per iteration; mutations don't affect others |
+| Nested dicts in `shared` | Recursively merged (keys from all iterations preserved) |
+| Lists in `shared` | Extended with new items (items appended in iteration order) |
+| Parallel execution | Results merged in batch index order (deterministic) |

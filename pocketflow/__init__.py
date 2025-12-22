@@ -1,6 +1,6 @@
 import asyncio, warnings, copy, time, contextvars
 from dataclasses import dataclass, field
-from typing import Any, Optional, List, Dict
+from typing import Any, Optional, List, Dict, Set, Tuple
 from enum import Enum
 
 class TraceEventType(Enum):
@@ -155,6 +155,548 @@ class FlowTracer:
         """Clear all recorded events."""
         self.events.clear()
         self._start_time = None
+
+
+@dataclass
+class NodeInfo:
+    """Information about a node in the flow structure.
+
+    Attributes:
+        name: The display name of the node, either from node.name or the class name.
+        node_type: The class name of the node (e.g., "Node", "AsyncNode", "Flow").
+        successors: Mapping of action names to target node names (e.g., {"default": "NextNode"}).
+        retry_config: Retry configuration if max_retries > 1, containing keys like
+            'max_retries', 'wait', 'exponential_backoff', 'max_wait'. None if no retry.
+        is_flow: True if the node is a Flow or subclass (Flow, AsyncFlow, BatchFlow, etc.).
+        is_async: True if the node is an async type (AsyncNode, AsyncFlow, etc.).
+        is_batch: True if the node is a batch type (BatchNode, BatchFlow, etc.).
+    """
+    name: str
+    node_type: str
+    successors: Dict[str, str]  # action -> target node name
+    retry_config: Optional[Dict[str, Any]] = None
+    is_flow: bool = False
+    is_async: bool = False
+    is_batch: bool = False
+
+
+@dataclass
+class TransitionInfo:
+    """Information about a transition between nodes.
+
+    Attributes:
+        from_node: The name of the source node where the transition originates.
+        to_node: The name of the target node where the transition leads.
+        action: The action string that triggers this transition (e.g., "default", "yes", "error").
+    """
+    from_node: str
+    to_node: str
+    action: str
+
+
+@dataclass
+class PathInfo:
+    """Information about a path through the flow.
+
+    Attributes:
+        nodes: Ordered list of node names representing the path (e.g., ["Start", "Process", "End"]).
+        actions: List of action strings taken between nodes. Length is len(nodes) - 1.
+        has_loop: True if this path contains a cycle (revisits a previously visited node).
+    """
+    nodes: List[str]
+    actions: List[str]
+    has_loop: bool = False
+
+
+class FlowStructure:
+    """Static analyzer for flow structure - see how flows will execute before running.
+
+    FlowStructure provides pre-execution visibility into your flow:
+    - What nodes exist and how they connect
+    - All possible paths through the flow
+    - Available transitions and actions
+    - Potential issues (unreachable nodes, missing transitions, loops)
+
+    While FlowTracer shows what happened during execution, FlowStructure shows
+    what CAN happen before you run anything.
+
+    Usage:
+        structure = FlowStructure(flow)
+        structure.print_structure()  # Visual overview
+
+        # Or get specific information
+        nodes = structure.get_nodes()
+        paths = structure.get_all_paths()
+        issues = structure.validate()
+    """
+
+    def __init__(self, flow_or_node):
+        """
+        Args:
+            flow_or_node: A Flow instance or any node that starts a chain
+        """
+        self._root = flow_or_node
+        self._nodes: Dict[str, NodeInfo] = {}
+        self._transitions: List[TransitionInfo] = []
+        self._analyze()
+
+    def _get_node_name(self, node) -> str:
+        """Get display name for a node."""
+        if hasattr(node, 'name') and node.name:
+            return node.name
+        return node.__class__.__name__
+
+    def _get_node_type(self, node) -> str:
+        """Get the type classification of a node."""
+        return node.__class__.__name__
+
+    def _is_flow(self, node) -> bool:
+        """Check if node is a Flow type using isinstance."""
+        # Import at runtime to avoid circular definition issues
+        # Flow is defined later in the module
+        return isinstance(node, Flow)
+
+    def _is_async(self, node) -> bool:
+        """Check if node is async using isinstance."""
+        # AsyncNode is defined later in the module
+        return isinstance(node, AsyncNode)
+
+    def _is_batch(self, node) -> bool:
+        """Check if node is a batch type using isinstance."""
+        # BatchNode and BatchFlow are defined later in the module
+        return isinstance(node, (BatchNode, BatchFlow))
+
+    def _get_retry_config(self, node) -> Optional[Dict[str, Any]]:
+        """Extract retry configuration from a node."""
+        if hasattr(node, 'max_retries') and node.max_retries > 1:
+            config = {'max_retries': node.max_retries}
+            if hasattr(node, 'wait') and node.wait > 0:
+                config['wait'] = node.wait
+            if hasattr(node, 'exponential_backoff') and node.exponential_backoff:
+                config['exponential_backoff'] = True
+            if hasattr(node, 'max_wait') and node.max_wait is not None:
+                config['max_wait'] = node.max_wait
+            return config
+        return None
+
+    def _analyze(self):
+        """Analyze the flow structure starting from root."""
+        visited: Set[int] = set()
+        self._traverse(self._root, visited)
+
+    def _traverse(self, node, visited: Set[int]):
+        """Recursively traverse and catalog all nodes."""
+        if node is None:
+            return
+
+        node_id = id(node)
+        if node_id in visited:
+            return
+        visited.add(node_id)
+
+        node_name = self._get_node_name(node)
+
+        # Handle name collisions by appending instance id
+        original_name = node_name
+        counter = 1
+        while node_name in self._nodes and id(self._nodes[node_name]) != node_id:
+            node_name = f"{original_name}_{counter}"
+            counter += 1
+
+        # Build successor mapping
+        successors: Dict[str, str] = {}
+        for action, successor in node.successors.items():
+            successor_name = self._get_node_name(successor)
+            successors[action] = successor_name
+            self._transitions.append(TransitionInfo(node_name, successor_name, action))
+
+        # If this is a Flow, add transition to its start_node (internal entry)
+        if self._is_flow(node) and hasattr(node, 'start_node') and node.start_node:
+            start_node_name = self._get_node_name(node.start_node)
+            successors['_start'] = start_node_name
+            self._transitions.append(TransitionInfo(node_name, start_node_name, '_start'))
+
+        # Create node info
+        self._nodes[node_name] = NodeInfo(
+            name=node_name,
+            node_type=self._get_node_type(node),
+            successors=successors,
+            retry_config=self._get_retry_config(node),
+            is_flow=self._is_flow(node),
+            is_async=self._is_async(node),
+            is_batch=self._is_batch(node)
+        )
+
+        # If this is a Flow, also traverse its internal structure
+        if self._is_flow(node) and hasattr(node, 'start_node') and node.start_node:
+            self._traverse(node.start_node, visited)
+
+        # Traverse successors
+        for successor in node.successors.values():
+            self._traverse(successor, visited)
+
+    def get_nodes(self) -> Dict[str, NodeInfo]:
+        """Get all nodes in the flow."""
+        return dict(self._nodes)
+
+    def get_node(self, name: str) -> Optional[NodeInfo]:
+        """Get information about a specific node."""
+        return self._nodes.get(name)
+
+    def get_transitions(self) -> List[TransitionInfo]:
+        """Get all transitions between nodes."""
+        return list(self._transitions)
+
+    def get_actions(self) -> Set[str]:
+        """Get all unique action names used in the flow."""
+        return {t.action for t in self._transitions}
+
+    def get_entry_points(self) -> List[str]:
+        """Get nodes that could be entry points (not targeted by any transition)."""
+        targeted = {t.to_node for t in self._transitions}
+        return [name for name in self._nodes if name not in targeted]
+
+    def get_exit_points(self) -> List[str]:
+        """Get nodes that are exit points (no outgoing transitions)."""
+        return [name for name, info in self._nodes.items() if not info.successors]
+
+    def get_successors(self, node_name: str) -> Dict[str, str]:
+        """Get the successors of a node (action -> target node name)."""
+        node = self._nodes.get(node_name)
+        return dict(node.successors) if node else {}
+
+    def get_predecessors(self, node_name: str) -> List[Tuple[str, str]]:
+        """Get nodes that transition to this node (list of (from_node, action) tuples)."""
+        return [(t.from_node, t.action) for t in self._transitions if t.to_node == node_name]
+
+    def _find_paths(self, start: str, end: Optional[str], visited: Set[str],
+                    path: List[str], actions: List[str], max_depth: int) -> List[PathInfo]:
+        """Recursively find paths through the flow."""
+        if max_depth <= 0:
+            return []
+
+        paths = []
+        node = self._nodes.get(start)
+
+        if not node:
+            return []
+
+        # Check if we've completed a path
+        if end is None and not node.successors:
+            # Path to any exit point
+            paths.append(PathInfo(list(path), list(actions), has_loop=False))
+        elif end is not None and start == end and len(path) > 1:
+            # Path to specific endpoint (and we've moved at least once)
+            paths.append(PathInfo(list(path), list(actions), has_loop=False))
+
+        # Continue exploring
+        for action, next_node in node.successors.items():
+            has_loop = next_node in visited
+            if has_loop:
+                # Record the loop path but don't continue traversing
+                loop_path = path + [next_node]
+                loop_actions = actions + [action]
+                paths.append(PathInfo(loop_path, loop_actions, has_loop=True))
+            else:
+                # Continue traversal
+                new_visited = visited | {next_node}
+                new_path = path + [next_node]
+                new_actions = actions + [action]
+                paths.extend(self._find_paths(next_node, end, new_visited,
+                                              new_path, new_actions, max_depth - 1))
+
+        return paths
+
+    def get_all_paths(self, from_node: Optional[str] = None, to_node: Optional[str] = None,
+                      max_depth: int = 50) -> List[PathInfo]:
+        """Get all possible paths through the flow.
+
+        Args:
+            from_node: Starting node (default: first entry point)
+            to_node: Target node (default: any exit point)
+            max_depth: Maximum path length to prevent infinite loops
+
+        Returns:
+            List of PathInfo objects describing each possible path
+        """
+        if from_node is None:
+            entry_points = self.get_entry_points()
+            if not entry_points:
+                return []
+            from_node = entry_points[0]
+
+        if from_node not in self._nodes:
+            return []
+
+        return self._find_paths(from_node, to_node, {from_node}, [from_node], [], max_depth)
+
+    def has_loops(self) -> bool:
+        """Check if the flow contains any loops/cycles."""
+        paths = self.get_all_paths()
+        return any(p.has_loop for p in paths)
+
+    def get_loops(self) -> List[PathInfo]:
+        """Get all paths that contain loops."""
+        return [p for p in self.get_all_paths() if p.has_loop]
+
+    def validate(self) -> List[Dict[str, Any]]:
+        """Validate the flow structure and return any issues found.
+
+        Returns:
+            List of issue dictionaries with 'type', 'message', and 'severity' keys
+        """
+        issues = []
+
+        # Check for missing start node in flows
+        root_name = self._get_node_name(self._root)
+        if self._is_flow(self._root):
+            if not hasattr(self._root, 'start_node') or self._root.start_node is None:
+                issues.append({
+                    'type': 'missing_start',
+                    'message': f"Flow '{root_name}' has no start node defined",
+                    'severity': 'error'
+                })
+
+        # Check for unreachable nodes (not the root and not targeted by transitions)
+        entry_points = set(self.get_entry_points())
+        if len(entry_points) > 1:
+            for node_name in entry_points:
+                if node_name != root_name:
+                    # Check if it's a start_node of a flow
+                    is_flow_start = False
+                    for name, info in self._nodes.items():
+                        if info.is_flow and node_name in info.successors.values():
+                            is_flow_start = True
+                            break
+                    if not is_flow_start:
+                        issues.append({
+                            'type': 'unreachable_node',
+                            'message': f"Node '{node_name}' may be unreachable (no incoming transitions)",
+                            'severity': 'warning'
+                        })
+
+        # Check for potential infinite loops (loops with no exit conditions)
+        # First, find all unique cycles by identifying nodes that loop back
+        checked_cycles: Set[frozenset] = set()
+        loops = self.get_loops()
+
+        for loop in loops:
+            if len(loop.nodes) < 2:
+                continue
+
+            # Build the actual cycle: from the loopback target to the node that loops back
+            loopback_target = loop.nodes[-1]  # Node being looped back to
+            loopback_target_idx = loop.nodes.index(loopback_target)  # First occurrence
+            cycle_nodes = set(loop.nodes[loopback_target_idx:-1])  # Nodes in the cycle
+
+            # Skip if we already checked this cycle
+            cycle_key = frozenset(cycle_nodes)
+            if cycle_key in checked_cycles:
+                continue
+            checked_cycles.add(cycle_key)
+
+            # Check if there's ANY exit from the cycle
+            # An exit is a transition from a cycle node to a node outside the cycle
+            has_exit = False
+            for node_name in cycle_nodes:
+                node = self._nodes.get(node_name)
+                if node:
+                    for action, next_node in node.successors.items():
+                        if next_node not in cycle_nodes:
+                            has_exit = True
+                            break
+                if has_exit:
+                    break
+
+            if not has_exit:
+                cycle_repr = ' -> '.join(loop.nodes[loopback_target_idx:])
+                issues.append({
+                    'type': 'potential_infinite_loop',
+                    'message': f"Loop detected ({cycle_repr}) with no apparent exit",
+                    'severity': 'warning'
+                })
+
+        return issues
+
+    def print_structure(self):
+        """Print a human-readable overview of the flow structure."""
+        print(f"\n{'='*60}")
+        print("FLOW STRUCTURE")
+        print(f"{'='*60}")
+
+        root_name = self._get_node_name(self._root)
+        print(f"Root: {root_name}")
+        print(f"Total nodes: {len(self._nodes)}")
+        print(f"Total transitions: {len(self._transitions)}")
+
+        # Entry and exit points
+        entry_points = self.get_entry_points()
+        exit_points = self.get_exit_points()
+        print(f"\nEntry points: {', '.join(entry_points) if entry_points else '(none)'}")
+        print(f"Exit points: {', '.join(exit_points) if exit_points else '(none)'}")
+
+        # Actions used
+        actions = self.get_actions()
+        if actions:
+            print(f"Actions used: {', '.join(sorted(actions))}")
+
+        # Nodes
+        print(f"\n{'─'*40}")
+        print("NODES")
+        print(f"{'─'*40}")
+        for name, info in self._nodes.items():
+            type_flags = []
+            if info.is_flow:
+                type_flags.append("Flow")
+            if info.is_async:
+                type_flags.append("Async")
+            if info.is_batch:
+                type_flags.append("Batch")
+
+            flags_str = f" [{', '.join(type_flags)}]" if type_flags else ""
+            print(f"\n  {name} ({info.node_type}){flags_str}")
+
+            if info.retry_config:
+                retry_str = f"max_retries={info.retry_config['max_retries']}"
+                if 'wait' in info.retry_config:
+                    retry_str += f", wait={info.retry_config['wait']}s"
+                if info.retry_config.get('exponential_backoff'):
+                    retry_str += ", exponential"
+                print(f"    Retry: {retry_str}")
+
+            if info.successors:
+                print(f"    Transitions:")
+                for action, target in info.successors.items():
+                    print(f"      --[{action}]--> {target}")
+            else:
+                print(f"    (exit point)")
+
+        # Paths
+        print(f"\n{'─'*40}")
+        print("POSSIBLE PATHS")
+        print(f"{'─'*40}")
+        paths = self.get_all_paths()
+        if paths:
+            for i, path in enumerate(paths[:10], 1):  # Limit to first 10
+                path_str = ' -> '.join(path.nodes)
+                loop_marker = " (LOOP)" if path.has_loop else ""
+                print(f"  {i}. {path_str}{loop_marker}")
+            if len(paths) > 10:
+                print(f"  ... and {len(paths) - 10} more paths")
+        else:
+            print("  (no complete paths found)")
+
+        # Validation
+        issues = self.validate()
+        if issues:
+            print(f"\n{'─'*40}")
+            print("ISSUES FOUND")
+            print(f"{'─'*40}")
+            for issue in issues:
+                severity = issue['severity'].upper()
+                print(f"  [{severity}] {issue['message']}")
+
+        print(f"\n{'='*60}\n")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Export structure as a dictionary for serialization."""
+        return {
+            'root': self._get_node_name(self._root),
+            'nodes': {
+                name: {
+                    'name': info.name,
+                    'type': info.node_type,
+                    'successors': info.successors,
+                    'retry_config': info.retry_config,
+                    'is_flow': info.is_flow,
+                    'is_async': info.is_async,
+                    'is_batch': info.is_batch
+                }
+                for name, info in self._nodes.items()
+            },
+            'transitions': [
+                {'from': t.from_node, 'to': t.to_node, 'action': t.action}
+                for t in self._transitions
+            ],
+            'entry_points': self.get_entry_points(),
+            'exit_points': self.get_exit_points(),
+            'actions': list(self.get_actions()),
+            'has_loops': self.has_loops(),
+            'issues': self.validate()
+        }
+
+    def to_mermaid(self) -> str:
+        """Generate a Mermaid diagram of the flow structure."""
+        lines = ["graph LR"]
+
+        # Add nodes
+        for name, info in self._nodes.items():
+            # Escape special characters in node names
+            safe_name = name.replace(" ", "_").replace("-", "_")
+            display_name = name.replace("'", "")
+
+            if info.is_flow:
+                lines.append(f"    {safe_name}[[\"{display_name}\"]]")
+            elif info.is_batch:
+                lines.append(f"    {safe_name}[/\"{display_name}\"/]")
+            else:
+                lines.append(f"    {safe_name}[\"{display_name}\"]")
+
+        # Add transitions
+        for t in self._transitions:
+            from_safe = t.from_node.replace(" ", "_").replace("-", "_")
+            to_safe = t.to_node.replace(" ", "_").replace("-", "_")
+            if t.action == "default" or t.action == "_start":
+                # Default and _start (internal flow entry) are shown without labels
+                lines.append(f"    {from_safe} --> {to_safe}")
+            else:
+                lines.append(f"    {from_safe} -->|{t.action}| {to_safe}")
+
+        return "\n".join(lines)
+
+    def compare_with_trace(self, tracer: 'FlowTracer') -> Dict[str, Any]:
+        """Compare the static structure with actual execution trace.
+
+        This helps identify:
+        - Which paths were actually taken vs available paths
+        - Nodes that were never executed
+        - Unexpected transitions
+
+        Args:
+            tracer: A FlowTracer with recorded execution data
+
+        Returns:
+            Comparison results dictionary
+        """
+        executed_nodes = set(tracer.get_execution_order())
+        all_nodes = set(self._nodes.keys())
+
+        executed_transitions = {
+            (t['from'], t['to'], t['action'])
+            for t in tracer.get_transitions()
+        }
+        all_transitions = {
+            (t.from_node, t.to_node, t.action)
+            for t in self._transitions
+        }
+
+        return {
+            'executed_nodes': list(executed_nodes),
+            'unexecuted_nodes': list(all_nodes - executed_nodes),
+            'executed_transitions': [
+                {'from': t[0], 'to': t[1], 'action': t[2]}
+                for t in executed_transitions
+            ],
+            'unused_transitions': [
+                {'from': t[0], 'to': t[1], 'action': t[2]}
+                for t in all_transitions - executed_transitions
+            ],
+            'coverage': {
+                'nodes': len(executed_nodes) / len(all_nodes) if all_nodes else 1.0,
+                'transitions': len(executed_transitions) / len(all_transitions) if all_transitions else 1.0
+            }
+        }
+
 
 # Context variable for async-safe tracer access (isolated per async task/coroutine)
 _current_tracer: contextvars.ContextVar[Optional[FlowTracer]] = contextvars.ContextVar('_current_tracer', default=None)

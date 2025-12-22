@@ -2,7 +2,7 @@ import asyncio
 import contextvars
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union, TypeVar, Generic
+from typing import Any, Dict, List, Optional, Union, TypeVar, Generic, Set, Tuple
 
 # Type variables for better type relationships
 _PrepResult = TypeVar('_PrepResult')
@@ -55,6 +55,112 @@ class FlowTracer:
     def print_summary(self) -> None: ...
     def to_dict(self) -> Dict[str, Any]: ...
     def clear(self) -> None: ...
+
+# --- Flow Structure Types ---
+
+@dataclass
+class NodeInfo:
+    """Information about a node in the flow structure.
+
+    Attributes:
+        name: The display name of the node, either from node.name or the class name.
+        node_type: The class name of the node (e.g., "Node", "AsyncNode", "Flow").
+        successors: Mapping of action names to target node names (e.g., {"default": "NextNode"}).
+        retry_config: Retry configuration if max_retries > 1, containing keys like
+            'max_retries', 'wait', 'exponential_backoff', 'max_wait'. None if no retry.
+        is_flow: True if the node is a Flow or subclass (Flow, AsyncFlow, BatchFlow, etc.).
+        is_async: True if the node is an async type (AsyncNode, AsyncFlow, etc.).
+        is_batch: True if the node is a batch type (BatchNode, BatchFlow, etc.).
+    """
+    name: str
+    node_type: str
+    successors: Dict[str, str]
+    retry_config: Optional[Dict[str, Any]] = None
+    is_flow: bool = False
+    is_async: bool = False
+    is_batch: bool = False
+
+@dataclass
+class TransitionInfo:
+    """Information about a transition between nodes.
+
+    Attributes:
+        from_node: The name of the source node where the transition originates.
+        to_node: The name of the target node where the transition leads.
+        action: The action string that triggers this transition (e.g., "default", "yes", "error").
+    """
+    from_node: str
+    to_node: str
+    action: str
+
+@dataclass
+class PathInfo:
+    """Information about a path through the flow.
+
+    Attributes:
+        nodes: Ordered list of node names representing the path (e.g., ["Start", "Process", "End"]).
+        actions: List of action strings taken between nodes. Length is len(nodes) - 1.
+        has_loop: True if this path contains a cycle (revisits a previously visited node).
+    """
+    nodes: List[str]
+    actions: List[str]
+    has_loop: bool = False
+
+class FlowStructure:
+    """Static analyzer for flow structure - see how flows will execute before running.
+
+    FlowStructure provides pre-execution visibility into your flow:
+    - What nodes exist and how they connect
+    - All possible paths through the flow
+    - Available transitions and actions
+    - Potential issues (unreachable nodes, missing transitions, loops)
+
+    While FlowTracer shows what happened during execution, FlowStructure shows
+    what CAN happen before you run anything.
+    """
+    _root: BaseNode[Any, Any, Any]
+    _nodes: Dict[str, NodeInfo]
+    _transitions: List[TransitionInfo]
+
+    def __init__(self, flow_or_node: BaseNode[Any, Any, Any]) -> None: ...
+    def _get_node_name(self, node: BaseNode[Any, Any, Any]) -> str: ...
+    def _get_node_type(self, node: BaseNode[Any, Any, Any]) -> str: ...
+    def _is_flow(self, node: BaseNode[Any, Any, Any]) -> bool: ...
+    def _is_async(self, node: BaseNode[Any, Any, Any]) -> bool: ...
+    def _is_batch(self, node: BaseNode[Any, Any, Any]) -> bool: ...
+    def _get_retry_config(self, node: BaseNode[Any, Any, Any]) -> Optional[Dict[str, Any]]: ...
+    def _analyze(self) -> None: ...
+    def _traverse(self, node: BaseNode[Any, Any, Any], visited: Set[int]) -> None: ...
+    def get_nodes(self) -> Dict[str, NodeInfo]: ...
+    def get_node(self, name: str) -> Optional[NodeInfo]: ...
+    def get_transitions(self) -> List[TransitionInfo]: ...
+    def get_actions(self) -> Set[str]: ...
+    def get_entry_points(self) -> List[str]: ...
+    def get_exit_points(self) -> List[str]: ...
+    def get_successors(self, node_name: str) -> Dict[str, str]: ...
+    def get_predecessors(self, node_name: str) -> List[Tuple[str, str]]: ...
+    def _find_paths(
+        self,
+        start: str,
+        end: Optional[str],
+        visited: Set[str],
+        path: List[str],
+        actions: List[str],
+        max_depth: int
+    ) -> List[PathInfo]: ...
+    def get_all_paths(
+        self,
+        from_node: Optional[str] = None,
+        to_node: Optional[str] = None,
+        max_depth: int = 50
+    ) -> List[PathInfo]: ...
+    def has_loops(self) -> bool: ...
+    def get_loops(self) -> List[PathInfo]: ...
+    def validate(self) -> List[Dict[str, Any]]: ...
+    def print_structure(self) -> None: ...
+    def to_dict(self) -> Dict[str, Any]: ...
+    def to_mermaid(self) -> str: ...
+    def compare_with_trace(self, tracer: FlowTracer) -> Dict[str, Any]: ...
 
 # --- Context Variable and Helper Functions ---
 

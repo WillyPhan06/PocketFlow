@@ -400,3 +400,31 @@ tracer.print_summary()
 ```
 
 This will output detailed information about the flow execution, including any retries that occurred and which branch was taken based on the data value.
+
+## 11. Combining with FlowStructure
+
+While `FlowTracer` shows what **did happen** during execution, `FlowStructure` shows what **can happen** before you run. Use them together for powerful debugging:
+
+```python
+from pocketflow import FlowStructure, FlowTracer
+
+# BEFORE running: understand the structure
+structure = FlowStructure(flow)
+structure.print_structure()  # See all possible paths
+
+# DURING running: trace execution
+tracer = FlowTracer()
+flow.run(shared, tracer=tracer)
+
+# AFTER running: compare expected vs actual
+comparison = structure.compare_with_trace(tracer)
+print(f"Node coverage: {comparison['coverage']['nodes']:.1%}")
+print(f"Unexecuted nodes: {comparison['unexecuted_nodes']}")
+```
+
+This helps you:
+- **Verify test coverage**: Are all branches being tested?
+- **Find dead code**: Which paths never execute?
+- **Debug unexpected behavior**: Compare expected paths vs actual
+
+See [Flow Structure](flow_structure.md) for complete documentation on static flow analysis.

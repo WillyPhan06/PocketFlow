@@ -142,3 +142,73 @@ data_science_flow.run({})
 The output would be: `Call stack: ['EvaluateModelNode', 'ModelFlow', 'DataScienceFlow']`
 
 For a more complete implementation, check out [the cookbook](https://github.com/The-Pocket/PocketFlow/tree/main/cookbook/pocketflow-tracing).
+
+## 3. Built-in Flow Analysis Tools
+
+For more robust debugging and visualization, PocketFlow provides built-in tools:
+
+### FlowStructure - Static Analysis
+
+Analyze your flow **before** running to understand its structure:
+
+```python
+from pocketflow import FlowStructure
+
+structure = FlowStructure(my_flow)
+
+# Print human-readable overview
+structure.print_structure()
+
+# Generate Mermaid diagram
+print(structure.to_mermaid())
+
+# Get all possible paths
+paths = structure.get_all_paths()
+
+# Validate for issues (missing start, infinite loops, etc.)
+issues = structure.validate()
+```
+
+See [Flow Structure](../core_abstraction/flow_structure.md) for complete documentation.
+
+### FlowTracer - Runtime Tracing
+
+Trace execution to see what actually happened:
+
+```python
+from pocketflow import FlowTracer
+
+tracer = FlowTracer()
+my_flow.run(shared, tracer=tracer)
+
+# Print execution summary
+tracer.print_summary()
+
+# Get execution order
+order = tracer.get_execution_order()
+
+# See which branches were taken
+transitions = tracer.get_transitions()
+```
+
+See [Flow Tracing](../core_abstraction/tracing.md) for complete documentation.
+
+### Combining Both
+
+Use both tools together for comprehensive debugging:
+
+```python
+from pocketflow import FlowStructure, FlowTracer
+
+# Before: understand what CAN happen
+structure = FlowStructure(flow)
+print(f"Possible paths: {len(structure.get_all_paths())}")
+
+# During: trace what DOES happen
+tracer = FlowTracer()
+flow.run(shared, tracer=tracer)
+
+# After: compare expected vs actual
+comparison = structure.compare_with_trace(tracer)
+print(f"Path coverage: {comparison['coverage']['nodes']:.1%}")
+```

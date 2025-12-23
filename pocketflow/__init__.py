@@ -9,6 +9,7 @@ class TraceEventType(Enum):
     NODE_EXEC = "node_exec"
     NODE_POST = "node_post"
     NODE_END = "node_end"
+    NODE_ERROR = "node_error"
     RETRY_ATTEMPT = "retry_attempt"
     RETRY_WAIT = "retry_wait"
     FALLBACK = "fallback"
@@ -26,6 +27,30 @@ class TraceEvent:
     def __repr__(self):
         data_str = f", data={self.data}" if self.data else ""
         return f"TraceEvent({self.event_type.value}, node={self.node_name}, t={self.timestamp:.4f}{data_str})"
+
+@dataclass
+class NodeError:
+    """Captures error information from a failed node execution.
+
+    This class represents an error state that can be routed through the flow
+    instead of crashing. When a node's exec() fails after all retries, the
+    default exec_fallback() returns a NodeError instead of raising the exception.
+
+    The post() method can check for errors using is_error() and route accordingly:
+        def post(self, shared, prep_res, exec_res):
+            if self.is_error(exec_res):
+                shared['last_error'] = exec_res
+                return "error"  # Route to error handler
+            return "success"
+    """
+    exception: Exception
+    exception_type: str
+    message: str
+    node_name: str
+    retry_count: int
+    max_retries: int
+    traceback_str: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
 
 class FlowTracer:
     """Lightweight tracer for debugging flow execution.
@@ -71,7 +96,7 @@ class FlowTracer:
             captured_data = {k: self._truncate(v) for k, v in data.items()}
         elif data:
             # Even without capture_data, record lightweight info like action names
-            captured_data = {k: v for k, v in data.items() if k in ('action', 'retry', 'max_retries', 'wait_time', 'error', 'from_node', 'to_node')}
+            captured_data = {k: v for k, v in data.items() if k in ('action', 'retry', 'max_retries', 'wait_time', 'error', 'from_node', 'to_node', 'type', 'retry_count')}
             if not captured_data:
                 captured_data = None
 
@@ -734,6 +759,8 @@ def _get_node_name(node) -> str:
 class BaseNode:
     def __init__(self): self.params,self.successors,self.name,self._cached_trace_name={},{},None,None
     def set_params(self,params): self.params=params
+    @staticmethod
+    def is_error(result): return isinstance(result, NodeError)
     def next(self,node,action="default"):
         if action in self.successors: warnings.warn(f"Overwriting successor for action '{action}'")
         self.successors[action]=node; return node
@@ -744,24 +771,25 @@ class BaseNode:
     def _run(self,shared,tracer=None):
         # Note: NODE_START/NODE_END are recorded at orchestration level (Flow._orch) for defensive tracing
         # This ensures tracing works even if _run is overridden by custom nodes
+        # Returns (action, exec_result) tuple for orchestrator to handle error routing
         tracer = tracer or _get_current_tracer()
         node_name = _get_node_name(self) if tracer else None
         p = self.prep(shared)
         if tracer: tracer.record(TraceEventType.NODE_PREP, node_name, {"prep_result": p} if tracer.capture_data else None)
         e = self._exec(p, tracer)
         if tracer: tracer.record(TraceEventType.NODE_EXEC, node_name, {"exec_result": e} if tracer.capture_data else None)
-        result = self.post(shared, p, e)
-        if tracer: tracer.record(TraceEventType.NODE_POST, node_name, {"action": result} if result else None)
-        return result
+        action = self.post(shared, p, e)
+        if tracer: tracer.record(TraceEventType.NODE_POST, node_name, {"action": action} if action else None)
+        return (action, e)  # Return tuple: (action from post, exec result)
     def run(self,shared,tracer=None):
         if self.successors: warnings.warn("Node won't run successors. Use Flow.")
         # For standalone node.run(), we need to record NODE_START/END here since no orchestrator
         tracer_to_use = tracer or _get_current_tracer()
         node_name = _get_node_name(self) if tracer_to_use else None
         if tracer_to_use: tracer_to_use.record(TraceEventType.NODE_START, node_name)
-        result = self._run(shared, tracer)
+        action, _ = self._run(shared, tracer)  # Unpack tuple, only return action for public API
         if tracer_to_use: tracer_to_use.record(TraceEventType.NODE_END, node_name)
-        return result
+        return action
     def __rshift__(self,other): return self.next(other)
     def __sub__(self,action):
         if isinstance(action,str): return _ConditionalTransition(self,action)
@@ -773,7 +801,9 @@ class _ConditionalTransition:
 
 class Node(BaseNode):
     def __init__(self,max_retries=1,wait=0,exponential_backoff=False,max_wait=None): super().__init__(); self.max_retries,self.wait,self.exponential_backoff,self.max_wait=max_retries,wait,exponential_backoff,max_wait
-    def exec_fallback(self,prep_res,exc): raise exc
+    def exec_fallback(self,prep_res,exc):
+        import traceback as tb
+        return NodeError(exception=exc,exception_type=type(exc).__name__,message=str(exc),node_name=_get_node_name(self),retry_count=self.cur_retry+1,max_retries=self.max_retries,traceback_str=tb.format_exc())
     def _get_wait_time(self,retry_count):
         if self.wait<=0: return 0
         w=self.wait*(2**retry_count) if self.exponential_backoff else self.wait
@@ -790,7 +820,10 @@ class Node(BaseNode):
             except Exception as e:
                 if i==self.max_retries-1:
                     if tracer: tracer.record(TraceEventType.FALLBACK, node_name, {"error": str(e)})
-                    return self.exec_fallback(prep_res,e)
+                    result = self.exec_fallback(prep_res,e)
+                    if isinstance(result, NodeError) and tracer:
+                        tracer.record(TraceEventType.NODE_ERROR, node_name, {"error": result.message, "type": result.exception_type, "retry_count": result.retry_count})
+                    return result
                 w=self._get_wait_time(i)
                 if tracer: tracer.record(TraceEventType.RETRY_WAIT, node_name, {"wait_time": w, "error": str(e)})
                 if w>0: time.sleep(w)
@@ -816,9 +849,18 @@ class Flow(BaseNode):
             curr_name = _get_node_name(curr) if tracer else None
             # Defensive tracing: record NODE_START at orchestration level in case _run is overridden
             if tracer: tracer.record(TraceEventType.NODE_START, curr_name)
-            last_action = curr._run(shared, tracer)
+            # _run returns (action, exec_result) tuple; handle backward compat if custom _run returns just action
+            run_result = curr._run(shared, tracer)
+            if isinstance(run_result, tuple):
+                last_action, exec_result = run_result
+            else:
+                last_action, exec_result = run_result, None  # Backward compat: custom _run returning just action
             # Defensive tracing: record NODE_END at orchestration level
             if tracer: tracer.record(TraceEventType.NODE_END, curr_name)
+            # Auto error routing: if exec result was NodeError and "error" successor exists, route there
+            if isinstance(exec_result, NodeError) and "error" in curr.successors:
+                shared["_error"] = exec_result  # Store error in shared for error handler
+                last_action = "error"
             nxt = self.get_next_node(curr, last_action)
             if tracer and nxt:
                 tracer.record(TraceEventType.TRANSITION, flow_name, {
@@ -828,16 +870,16 @@ class Flow(BaseNode):
                 })
             curr = copy.copy(nxt)
         return last_action
-    def _run(self,shared,tracer=None): p=self.prep(shared); o=self._orch(shared,tracer=tracer); return self.post(shared,p,o)
+    def _run(self,shared,tracer=None): p=self.prep(shared); o=self._orch(shared,tracer=tracer); return (self.post(shared,p,o), None)  # Return tuple (action, None) for consistency
     def run(self,shared,tracer=None):
         token = _set_current_tracer(tracer) if tracer else None
         flow_name = _get_node_name(self)
         if tracer: tracer.record(TraceEventType.FLOW_START, flow_name)
         try:
             if self.successors: warnings.warn("Node won't run successors. Use Flow.")
-            result = self._run(shared, tracer)
+            action, _ = self._run(shared, tracer)  # Unpack tuple, only return action for public API
             if tracer: tracer.record(TraceEventType.FLOW_END, flow_name)
-            return result
+            return action
         finally:
             if token: _reset_current_tracer(token)
     def post(self,shared,prep_res,exec_res): return exec_res
@@ -914,12 +956,14 @@ class BatchFlow(Flow):
             self._orch(shared_copy,params_copy,tracer)
             # Merge only changes from shared_copy into shared
             BatchFlow._deep_merge(shared,shared_copy,original_shared)
-        return self.post(shared,pr,None)
+        return (self.post(shared,pr,None), None)  # Return tuple for consistency
 
 class AsyncNode(Node):
     async def prep_async(self,shared): pass
     async def exec_async(self,prep_res): pass
-    async def exec_fallback_async(self,prep_res,exc): raise exc
+    async def exec_fallback_async(self,prep_res,exc):
+        import traceback as tb
+        return NodeError(exception=exc,exception_type=type(exc).__name__,message=str(exc),node_name=_get_node_name(self),retry_count=self.cur_retry+1,max_retries=self.max_retries,traceback_str=tb.format_exc())
     async def post_async(self,shared,prep_res,exec_res): pass
     async def _exec(self,prep_res,tracer=None):
         tracer = tracer or _get_current_tracer()
@@ -933,7 +977,10 @@ class AsyncNode(Node):
             except Exception as e:
                 if i==self.max_retries-1:
                     if tracer: tracer.record(TraceEventType.FALLBACK, node_name, {"error": str(e)})
-                    return await self.exec_fallback_async(prep_res,e)
+                    result = await self.exec_fallback_async(prep_res,e)
+                    if isinstance(result, NodeError) and tracer:
+                        tracer.record(TraceEventType.NODE_ERROR, node_name, {"error": result.message, "type": result.exception_type, "retry_count": result.retry_count})
+                    return result
                 w=self._get_wait_time(i)
                 if tracer: tracer.record(TraceEventType.RETRY_WAIT, node_name, {"wait_time": w, "error": str(e)})
                 if w>0: await asyncio.sleep(w)
@@ -943,20 +990,21 @@ class AsyncNode(Node):
         tracer_to_use = tracer or _get_current_tracer()
         node_name = _get_node_name(self) if tracer_to_use else None
         if tracer_to_use: tracer_to_use.record(TraceEventType.NODE_START, node_name)
-        result = await self._run_async(shared,tracer)
+        action, _ = await self._run_async(shared,tracer)  # Unpack tuple, only return action for public API
         if tracer_to_use: tracer_to_use.record(TraceEventType.NODE_END, node_name)
-        return result
+        return action
     async def _run_async(self,shared,tracer=None):
         # Note: NODE_START/NODE_END are recorded at orchestration level (AsyncFlow._orch_async) for defensive tracing
+        # Returns (action, exec_result) tuple for orchestrator to handle error routing
         tracer = tracer or _get_current_tracer()
         node_name = _get_node_name(self) if tracer else None
         p=await self.prep_async(shared)
         if tracer: tracer.record(TraceEventType.NODE_PREP, node_name, {"prep_result": p} if tracer.capture_data else None)
         e=await self._exec(p,tracer)
         if tracer: tracer.record(TraceEventType.NODE_EXEC, node_name, {"exec_result": e} if tracer.capture_data else None)
-        result=await self.post_async(shared,p,e)
-        if tracer: tracer.record(TraceEventType.NODE_POST, node_name, {"action": result} if result else None)
-        return result
+        action=await self.post_async(shared,p,e)
+        if tracer: tracer.record(TraceEventType.NODE_POST, node_name, {"action": action} if action else None)
+        return (action, e)  # Return tuple: (action from post, exec result)
     def _run(self,shared,tracer=None): raise RuntimeError("Use run_async.")
 
 class AsyncBatchNode(AsyncNode,BatchNode):
@@ -996,9 +1044,21 @@ class AsyncFlow(Flow,AsyncNode):
             curr_name = _get_node_name(curr) if tracer else None
             # Defensive tracing: record NODE_START at orchestration level
             if tracer: tracer.record(TraceEventType.NODE_START, curr_name)
-            last_action = await curr._run_async(shared,tracer) if isinstance(curr,AsyncNode) else curr._run(shared,tracer)
+            # _run/_run_async returns (action, exec_result) tuple; handle backward compat if custom _run returns just action
+            if isinstance(curr,AsyncNode):
+                run_result = await curr._run_async(shared,tracer)
+            else:
+                run_result = curr._run(shared,tracer)
+            if isinstance(run_result, tuple):
+                last_action, exec_result = run_result
+            else:
+                last_action, exec_result = run_result, None  # Backward compat: custom _run returning just action
             # Defensive tracing: record NODE_END at orchestration level
             if tracer: tracer.record(TraceEventType.NODE_END, curr_name)
+            # Auto error routing: if exec result was NodeError and "error" successor exists, route there
+            if isinstance(exec_result, NodeError) and "error" in curr.successors:
+                shared["_error"] = exec_result  # Store error in shared for error handler
+                last_action = "error"
             nxt = self.get_next_node(curr, last_action)
             if tracer and nxt:
                 tracer.record(TraceEventType.TRANSITION, flow_name, {
@@ -1008,16 +1068,16 @@ class AsyncFlow(Flow,AsyncNode):
                 })
             curr = copy.copy(nxt)
         return last_action
-    async def _run_async(self,shared,tracer=None): p=await self.prep_async(shared); o=await self._orch_async(shared,tracer=tracer); return await self.post_async(shared,p,o)
+    async def _run_async(self,shared,tracer=None): p=await self.prep_async(shared); o=await self._orch_async(shared,tracer=tracer); return (await self.post_async(shared,p,o), None)  # Return tuple for consistency
     async def run_async(self,shared,tracer=None):
         token = _set_current_tracer(tracer) if tracer else None
         flow_name = _get_node_name(self)
         if tracer: tracer.record(TraceEventType.FLOW_START, flow_name)
         try:
             if self.successors: warnings.warn("Node won't run successors. Use Flow.")
-            result = await self._run_async(shared, tracer)
+            action, _ = await self._run_async(shared, tracer)  # Unpack tuple, only return action for public API
             if tracer: tracer.record(TraceEventType.FLOW_END, flow_name)
-            return result
+            return action
         finally:
             if token: _reset_current_tracer(token)
     async def post_async(self,shared,prep_res,exec_res): return exec_res
@@ -1032,7 +1092,7 @@ class AsyncBatchFlow(AsyncFlow,BatchFlow):
             await self._orch_async(shared_copy,params_copy,tracer)
             # Merge only changes from shared_copy into shared
             BatchFlow._deep_merge(shared,shared_copy,original_shared)
-        return await self.post_async(shared,pr,None)
+        return (await self.post_async(shared,pr,None), None)  # Return tuple for consistency
 
 class AsyncParallelBatchFlow(AsyncFlow,BatchFlow):
     def __init__(self,start=None,concurrency_limit=None):
@@ -1058,4 +1118,4 @@ class AsyncParallelBatchFlow(AsyncFlow,BatchFlow):
         # Sort by index to ensure deterministic merge order
         for idx,shared_copy in sorted(results,key=lambda x:x[0]):
             BatchFlow._deep_merge(shared,shared_copy,original_shared)
-        return await self.post_async(shared,pr,None)
+        return (await self.post_async(shared,pr,None), None)  # Return tuple for consistency

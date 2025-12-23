@@ -99,18 +99,48 @@ class TestAsyncParallelBatchNode(unittest.TestCase):
     
     def test_error_handling(self):
         """
-        Test error handling during parallel processing
+        Test error handling during parallel processing - default behavior returns NodeError
+        """
+        from pocketflow import NodeError
+
+        class ErrorProcessor(AsyncParallelNumberProcessor):
+            async def exec_async(self, item):
+                if item == 2:
+                    raise ValueError(f"Error processing item {item}")
+                return item
+
+        shared_storage = {
+            'input_numbers': [1, 2, 3]
+        }
+
+        processor = ErrorProcessor()
+        self.loop.run_until_complete(processor.run_async(shared_storage))
+
+        # With new error-as-state behavior, NodeError is returned in processed_numbers
+        results = shared_storage.get('processed_numbers', [])
+        self.assertEqual(len(results), 3)
+        # Item at index 1 (value 2) should be NodeError
+        self.assertIsInstance(results[1], NodeError)
+        self.assertEqual(results[1].exception_type, "ValueError")
+        self.assertIn("Error processing item 2", results[1].message)
+
+    def test_error_handling_explicit_raise(self):
+        """
+        Test error handling with explicit raise - crashes the flow
         """
         class ErrorProcessor(AsyncParallelNumberProcessor):
             async def exec_async(self, item):
                 if item == 2:
                     raise ValueError(f"Error processing item {item}")
                 return item
-        
+
+            async def exec_fallback_async(self, prep_res, exc):
+                raise exc  # Explicitly re-raise
+
         shared_storage = {
             'input_numbers': [1, 2, 3]
         }
-        
+
         processor = ErrorProcessor()
         with self.assertRaises(ValueError):
             self.loop.run_until_complete(processor.run_async(shared_storage))

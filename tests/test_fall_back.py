@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from pocketflow import Node, AsyncNode, Flow, AsyncFlow
+from pocketflow import Node, AsyncNode, Flow, AsyncFlow, NodeError
 
 class FallbackNode(Node):
     def __init__(self, should_fail=True, max_retries=1):
@@ -106,22 +106,48 @@ class TestExecFallback(unittest.TestCase):
         self.assertEqual(shared_storage['final_result'], [{'attempts': 1, 'result': 'fallback'}] )
 
     def test_no_fallback_implementation(self):
-        """Test that default fallback behavior raises the exception"""
+        """Test that default fallback behavior returns NodeError instead of raising"""
         class NoFallbackNode(Node):
             def prep(self, shared_storage):
                 if 'results' not in shared_storage:
                     shared_storage['results'] = []
                 return None
-            
+
             def exec(self, prep_result):
                 raise ValueError("Test error")
-            
+
             def post(self, shared_storage, prep_result, exec_result):
                 shared_storage['results'].append({'result': exec_result})
                 return exec_result
-        
+
         shared_storage = {}
         node = NoFallbackNode()
+        # Default behavior now returns NodeError instead of raising
+        node.run(shared_storage)
+
+        self.assertEqual(len(shared_storage['results']), 1)
+        result = shared_storage['results'][0]['result']
+        self.assertIsInstance(result, NodeError)
+        self.assertEqual(result.exception_type, "ValueError")
+        self.assertEqual(result.message, "Test error")
+
+    def test_explicit_raise_fallback(self):
+        """Test that explicitly raising in exec_fallback still crashes the flow"""
+        class RaisingFallbackNode(Node):
+            def prep(self, shared_storage):
+                return None
+
+            def exec(self, prep_result):
+                raise ValueError("Test error")
+
+            def exec_fallback(self, prep_result, exc):
+                raise exc
+
+            def post(self, shared_storage, prep_result, exec_result):
+                return exec_result
+
+        shared_storage = {}
+        node = RaisingFallbackNode()
         with self.assertRaises(ValueError):
             node.run(shared_storage)
 
@@ -199,25 +225,55 @@ class TestAsyncExecFallback(unittest.TestCase):
         self.assertEqual(shared_storage['final_result'], "async_fallback")
 
     def test_async_no_fallback_implementation(self):
-        """Test that default async fallback behavior raises the exception"""
+        """Test that default async fallback behavior returns NodeError instead of raising"""
         class NoFallbackAsyncNode(AsyncNode):
             async def prep_async(self, shared_storage):
                 if 'results' not in shared_storage:
                     shared_storage['results'] = []
                 return None
-            
+
             async def exec_async(self, prep_result):
                 raise ValueError("Test async error")
-            
+
             async def post_async(self, shared_storage, prep_result, exec_result):
                 shared_storage['results'].append({'result': exec_result})
                 return exec_result
-        
+
         async def run_test():
             shared_storage = {}
             node = NoFallbackAsyncNode()
             await node.run_async(shared_storage)
-        
+            return shared_storage
+
+        # Default behavior now returns NodeError instead of raising
+        shared_storage = self.loop.run_until_complete(run_test())
+
+        self.assertEqual(len(shared_storage['results']), 1)
+        result = shared_storage['results'][0]['result']
+        self.assertIsInstance(result, NodeError)
+        self.assertEqual(result.exception_type, "ValueError")
+        self.assertEqual(result.message, "Test async error")
+
+    def test_async_explicit_raise_fallback(self):
+        """Test that explicitly raising in async exec_fallback still crashes the flow"""
+        class RaisingFallbackAsyncNode(AsyncNode):
+            async def prep_async(self, shared_storage):
+                return None
+
+            async def exec_async(self, prep_result):
+                raise ValueError("Test async error")
+
+            async def exec_fallback_async(self, prep_result, exc):
+                raise exc
+
+            async def post_async(self, shared_storage, prep_result, exec_result):
+                return exec_result
+
+        async def run_test():
+            shared_storage = {}
+            node = RaisingFallbackAsyncNode()
+            await node.run_async(shared_storage)
+
         with self.assertRaises(ValueError):
             self.loop.run_until_complete(run_test())
 

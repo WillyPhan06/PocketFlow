@@ -97,8 +97,10 @@ class TestAsyncParallelBatchFlow(unittest.TestCase):
 
     def test_error_handling(self):
         """
-        Test error handling in parallel batch flow
+        Test error handling in parallel batch flow - default behavior returns NodeError
         """
+        from pocketflow import NodeError
+
         class ErrorProcessor(AsyncParallelNumberProcessor):
             async def exec_async(self, item):
                 if item == 2:
@@ -118,7 +120,46 @@ class TestAsyncParallelBatchFlow(unittest.TestCase):
 
         processor = ErrorProcessor()
         flow = ErrorBatchFlow(start=processor)
-        
+
+        # With new error-as-state behavior, NodeError is returned instead of raising
+        self.loop.run_until_complete(flow.run_async(shared_storage))
+
+        # Verify processed_numbers contains NodeError for the failed item (batch 0, index 1)
+        processed = shared_storage.get('processed_numbers', {})
+        batch_0_results = processed.get(0, [])
+        self.assertEqual(len(batch_0_results), 3)
+        # Item at index 1 (value 2) should be NodeError
+        self.assertIsInstance(batch_0_results[1], NodeError)
+        self.assertEqual(batch_0_results[1].exception_type, "ValueError")
+        self.assertIn("Error processing item 2", batch_0_results[1].message)
+
+    def test_error_handling_explicit_raise(self):
+        """
+        Test error handling with explicit raise - crashes the flow
+        """
+        class ErrorProcessor(AsyncParallelNumberProcessor):
+            async def exec_async(self, item):
+                if item == 2:
+                    raise ValueError(f"Error processing item {item}")
+                return item
+
+            async def exec_fallback_async(self, prep_res, exc):
+                raise exc  # Explicitly re-raise
+
+        class ErrorBatchFlow(AsyncParallelBatchFlow):
+            async def prep_async(self, shared_storage):
+                return [{'batch_id': i} for i in range(len(shared_storage['batches']))]
+
+        shared_storage = {
+            'batches': [
+                [1, 2, 3],  # Contains error-triggering value
+                [4, 5, 6]
+            ]
+        }
+
+        processor = ErrorProcessor()
+        flow = ErrorBatchFlow(start=processor)
+
         with self.assertRaises(ValueError):
             self.loop.run_until_complete(flow.run_async(shared_storage))
 

@@ -62,16 +62,114 @@ class RetryNode(Node):
         raise Exception("Failed")
 ```
 
-### Graceful Fallback
+### Error as State (Automatic Error Routing)
 
-To **gracefully handle** the exception (after all retries) rather than raising it, override:
+By default, when `exec()` fails after all retries, the Node returns a `NodeError` object instead of crashing. **The Flow orchestrator automatically detects this and routes to an `"error"` successor if one exists** - no manual checking required!
 
-```python 
-def exec_fallback(self, prep_res, exc):
-    raise exc
+#### Why Error as State?
+
+Traditional exception handling crashes the entire flow when a node fails, leaving developers with:
+- **No graceful recovery path** - the flow just dies
+- **Limited debugging info** - stack traces without context
+- **No flow control** - can't route to different handlers based on error types
+
+By treating errors as state (`NodeError`), the flow can:
+- **Continue executing** through error-handling nodes
+- **Preserve rich error context** for debugging and logging
+- **Route intelligently** to different handlers based on error types
+- **Keep the workflow smooth** without unexpected crashes
+
+```python
+from pocketflow import Node, Flow, NodeError
+
+class APINode(Node):
+    def exec(self, prep_res):
+        return call_external_api()  # Might fail
+
+    def post(self, shared, prep_res, exec_res):
+        # No need to check for errors - orchestrator handles it!
+        shared['result'] = exec_res
+        return "success"
+
+class ErrorHandler(Node):
+    def prep(self, shared):
+        return shared.get('_error')  # Error auto-stored in shared['_error']
+
+    def exec(self, prep_res):
+        # Access rich error info
+        print(f"Error type: {prep_res.exception_type}")
+        print(f"Message: {prep_res.message}")
+        print(f"Retries: {prep_res.retry_count}/{prep_res.max_retries}")
+        print(f"Traceback:\n{prep_res.traceback_str}")
+        return "handled"
+
+# Flow setup with error routing
+api_node = APINode(max_retries=3)
+error_handler = ErrorHandler()
+success_node = SuccessNode()
+
+api_node - "success" >> success_node
+api_node - "error" >> error_handler  # Automatically routes here on error!
+
+flow = Flow(start=api_node)
+flow.run(shared)
 ```
 
-By default, it just re-raises exception. But you can return a fallback result instead, which becomes the `exec_res` passed to `post()`.
+**How it works:**
+1. When `exec()` fails after retries, `exec_fallback()` returns a `NodeError`
+2. The Flow orchestrator checks if the node has an `"error"` successor
+3. If yes, it stores the error in `shared["_error"]` and routes to the error handler
+4. If no `"error"` successor exists, the `post()` action is used (allowing manual handling)
+
+The `NodeError` object contains:
+- `exception`: The original exception object
+- `exception_type`: String name of the exception (e.g., "ValueError")
+- `message`: The error message
+- `node_name`: Name of the node that failed
+- `retry_count`: How many attempts were made
+- `max_retries`: Maximum retries configured
+- `traceback_str`: Full traceback for debugging
+- `timestamp`: When the error occurred
+
+#### Implementation Design: Tuple Return Pattern
+
+The Flow orchestrator receives both the action and exec result from `_run()` as a tuple `(action, exec_result)`. This design was chosen over storing state on the node instance for important reasons:
+
+**Why a tuple instead of node attributes?**
+- **Thread/async safety**: Storing `_last_exec_result` on the node could cause race conditions when nodes run in parallel (e.g., in `AsyncParallelBatchFlow`)
+- **Immutability**: The tuple is returned directly and cannot be modified after `_run()` completes
+- **Clarity**: The orchestrator explicitly receives both values, making the data flow obvious
+
+**Backward compatibility**: Custom `_run()` implementations that return just an action (not a tuple) still work - the orchestrator handles both cases gracefully.
+
+### Manual Error Handling (Optional)
+
+If you need custom error handling logic (e.g., different actions based on error type), you can still use `is_error()` in `post()`:
+
+```python
+def post(self, shared, prep_res, exec_res):
+    if self.is_error(exec_res):
+        if "rate limit" in exec_res.message:
+            return "retry_later"  # Custom action
+        return "fatal_error"
+    return "success"
+```
+
+### Custom Fallback (Override Default)
+
+To customize the fallback behavior, override `exec_fallback()`:
+
+```python
+def exec_fallback(self, prep_res, exc):
+    # Option 1: Re-raise to crash the flow (old behavior)
+    raise exc
+
+    # Option 2: Return a custom fallback value
+    return "fallback_result"
+
+    # Option 3: Return default NodeError (current default)
+    return super().exec_fallback(prep_res, exc)
+```
 
 ### Example: Summarize file
 

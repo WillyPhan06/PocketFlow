@@ -2,7 +2,7 @@ import asyncio
 import contextvars
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union, TypeVar, Generic, Set, Tuple
+from typing import Any, Dict, List, Optional, Union, TypeVar, Generic, Set, Tuple, Literal, Callable
 
 # Type variables for better type relationships
 _PrepResult = TypeVar('_PrepResult')
@@ -13,6 +13,9 @@ _PostResult = TypeVar('_PostResult')
 ParamValue = Union[str, int, float, bool, None, List[Any], Dict[str, Any]]
 SharedData = Dict[str, Any]
 Params = Dict[str, ParamValue]
+
+# Type alias for sort_by parameter in timing methods
+SortByPhase = Literal['total', 'prep', 'exec', 'post']
 
 # --- Tracing Types ---
 
@@ -36,6 +39,32 @@ class TraceEvent:
     node_name: str
     timestamp: float
     data: Optional[Dict[str, Any]]
+
+    def __repr__(self) -> str: ...
+
+@dataclass
+class NodeTiming:
+    """Timing information for a single node execution.
+
+    This dataclass captures the duration of each phase (prep, exec, post) of node
+    execution, helping developers identify performance bottlenecks.
+
+    Attributes:
+        node_name: The name of the node.
+        prep_time: Time in seconds for the prep() phase. None if not recorded.
+        exec_time: Time in seconds for the exec() phase. None if not recorded.
+        post_time: Time in seconds for the post() phase. None if not recorded.
+        total_time: Total time from NODE_START to NODE_END in seconds. None if incomplete.
+        start_timestamp: Absolute timestamp when node started.
+        end_timestamp: Absolute timestamp when node ended. None if not yet ended.
+    """
+    node_name: str
+    prep_time: Optional[float] = None
+    exec_time: Optional[float] = None
+    post_time: Optional[float] = None
+    total_time: Optional[float] = None
+    start_timestamp: Optional[float] = None
+    end_timestamp: Optional[float] = None
 
     def __repr__(self) -> str: ...
 
@@ -70,6 +99,78 @@ class FlowTracer:
     def get_transitions(self) -> List[Dict[str, str]]: ...
     def get_retries(self) -> List[Dict[str, Any]]: ...
     def get_duration(self) -> float: ...
+    def get_node_timings(self) -> List[NodeTiming]:
+        """Get timing information for all executed nodes.
+
+        Calculates prep, exec, and post phase durations for each node by analyzing
+        the recorded trace events. Returns a list of NodeTiming objects with
+        detailed timing breakdowns.
+
+        Returns:
+            List of NodeTiming objects, one per node execution in order of execution.
+        """
+        ...
+    def _get_sort_key(self, sort_by: SortByPhase) -> Callable[[NodeTiming], float]:
+        """Get the sorting key function for a given sort_by parameter.
+
+        Args:
+            sort_by: One of 'total', 'prep', 'exec', or 'post'.
+
+        Returns:
+            A function that extracts the timing value for sorting.
+
+        Raises:
+            ValueError: If sort_by is not a valid option.
+        """
+        ...
+    def get_slowest_nodes(self, n: Optional[int] = None, sort_by: SortByPhase = 'total') -> List[NodeTiming]:
+        """Get the slowest nodes sorted by the specified timing phase.
+
+        Useful for identifying multiple performance bottlenecks in your flow.
+        Returns nodes sorted from slowest to fastest.
+
+        Args:
+            n: Maximum number of nodes to return. None returns all nodes sorted.
+            sort_by: Which timing to sort by. One of:
+                - 'total': Total execution time (default)
+                - 'prep': Time spent in prep() phase
+                - 'exec': Time spent in exec() phase
+                - 'post': Time spent in post() phase
+
+        Returns:
+            List of NodeTiming objects sorted from slowest to fastest.
+
+        Raises:
+            ValueError: If sort_by is not a valid option.
+        """
+        ...
+    def get_slowest_node(self, sort_by: SortByPhase = 'total') -> Optional[NodeTiming]:
+        """Get the timing info for the slowest node.
+
+        Useful for quickly identifying the main performance bottleneck in your flow.
+
+        Args:
+            sort_by: Which timing to use for finding the slowest node. One of:
+                - 'total': Total execution time (default)
+                - 'prep': Time spent in prep() phase
+                - 'exec': Time spent in exec() phase
+                - 'post': Time spent in post() phase
+
+        Returns:
+            NodeTiming for the slowest node, or None if no nodes were traced.
+
+        Raises:
+            ValueError: If sort_by is not a valid option.
+        """
+        ...
+    def print_timing_table(self) -> None:
+        """Print a formatted table showing timing for each node.
+
+        Displays node name, prep time, exec time, post time, and total time
+        in a tabular format. Also highlights the slowest node to help identify
+        performance bottlenecks.
+        """
+        ...
     def print_summary(self) -> None: ...
     def to_dict(self) -> Dict[str, Any]: ...
     def clear(self) -> None: ...

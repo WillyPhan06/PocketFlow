@@ -295,21 +295,195 @@ order = tracer.get_execution_order()
 # ['CustomNode', ...]  # CustomNode is included
 ```
 
-## 9. Performance Considerations
+## 9. Node Timing and Performance Analysis
+
+The tracer automatically measures how long each node takes to execute, broken down by phase (prep, exec, post). This helps you identify performance bottlenecks.
+
+### Get Timing for All Nodes
+
+```python
+from pocketflow import FlowTracer, NodeTiming
+
+tracer = FlowTracer()
+flow.run(shared, tracer=tracer)
+
+# Get timing information for all executed nodes
+timings = tracer.get_node_timings()
+for t in timings:
+    print(f"{t.node_name}: total={t.total_time:.4f}s")
+    print(f"  prep={t.prep_time:.4f}s, exec={t.exec_time:.4f}s, post={t.post_time:.4f}s")
+```
+
+Each `NodeTiming` object contains:
+- `node_name`: Name of the node
+- `prep_time`: Time spent in `prep()` (seconds)
+- `exec_time`: Time spent in `exec()` (seconds)
+- `post_time`: Time spent in `post()` (seconds)
+- `total_time`: Total time from start to end (seconds)
+- `start_timestamp`: When the node started executing
+- `end_timestamp`: When the node finished executing
+
+### Find the Slowest Node
+
+Quickly identify the bottleneck:
+
+```python
+slowest = tracer.get_slowest_node()
+if slowest:
+    print(f"Slowest node: {slowest.node_name} ({slowest.total_time:.4f}s)")
+    print(f"  prep: {slowest.prep_time:.4f}s")
+    print(f"  exec: {slowest.exec_time:.4f}s")
+    print(f"  post: {slowest.post_time:.4f}s")
+```
+
+You can also find the slowest node by a specific phase:
+
+```python
+# Find node with slowest prep phase
+slowest_prep = tracer.get_slowest_node(sort_by='prep')
+
+# Find node with slowest exec phase
+slowest_exec = tracer.get_slowest_node(sort_by='exec')
+
+# Find node with slowest post phase
+slowest_post = tracer.get_slowest_node(sort_by='post')
+```
+
+### Get Multiple Slow Nodes
+
+To identify multiple bottlenecks, use `get_slowest_nodes()`:
+
+```python
+# Get all nodes sorted by total time (slowest first)
+all_sorted = tracer.get_slowest_nodes()
+
+# Get top 5 slowest nodes
+top5 = tracer.get_slowest_nodes(n=5)
+
+# Get top 3 nodes with slowest exec phase
+slow_exec = tracer.get_slowest_nodes(n=3, sort_by='exec')
+
+# Sort by prep time
+by_prep = tracer.get_slowest_nodes(sort_by='prep')
+```
+
+The `sort_by` parameter accepts:
+- `'total'` - Total execution time (default)
+- `'prep'` - Time spent in `prep()` phase
+- `'exec'` - Time spent in `exec()` phase
+- `'post'` - Time spent in `post()` phase
+
+### Print a Timing Table
+
+For a visual overview, use the timing table:
+
+```python
+tracer.print_timing_table()
+```
+
+Output:
+```
+======================================================================
+NODE TIMING TABLE
+======================================================================
+Node            |         Prep |         Exec |         Post |        Total
+--------------------------------------------------------------------------------
+ValidateInput   |   0.000123s |   0.001234s |   0.000045s |   0.001402s
+ProcessData     |   0.000089s |   0.052341s |   0.000067s |   0.052497s <-- SLOWEST
+SaveResult      |   0.000156s |   0.003421s |   0.000078s |   0.003655s
+======================================================================
+
+Slowest node: ProcessData (0.052497s)
+Slowest phase: exec (0.052341s)
+```
+
+### Timing in print_summary()
+
+The `print_summary()` method now includes timing information:
+
+```python
+tracer.print_summary()
+```
+
+Output includes a "Node timings" section:
+```
+Node timings:
+  ValidateInput: 0.0014s (prep=0.0001s, exec=0.0012s, post=0.0000s)
+  ProcessData: 0.0525s (prep=0.0001s, exec=0.0523s, post=0.0001s)
+  SaveResult: 0.0037s (prep=0.0002s, exec=0.0034s, post=0.0001s)
+
+  Slowest: ProcessData (0.0525s)
+```
+
+### Timing in to_dict()
+
+The `to_dict()` export includes timing data:
+
+```python
+trace_dict = tracer.to_dict()
+# {
+#   'duration': 0.0576,
+#   'execution_order': [...],
+#   'transitions': [...],
+#   'retries': [...],
+#   'node_timings': [
+#     {
+#       'node_name': 'ValidateInput',
+#       'prep_time': 0.000123,
+#       'exec_time': 0.001234,
+#       'post_time': 0.000045,
+#       'total_time': 0.001402,
+#       'start_timestamp': 1703456789.123,
+#       'end_timestamp': 1703456789.124
+#     },
+#     ...
+#   ],
+#   'slowest_node': {
+#     'node_name': 'ProcessData',
+#     'total_time': 0.052497,
+#     'prep_time': 0.000089,
+#     'exec_time': 0.052341,
+#     'post_time': 0.000067
+#   },
+#   'events': [...]
+# }
+```
+
+This makes it easy to:
+- Log timing data to your monitoring system
+- Compare performance across different runs
+- Export to JSON for analysis tools
+
+### Async Node Timing
+
+Timing works the same way with async nodes:
+
+```python
+tracer = FlowTracer()
+await async_flow.run_async(shared, tracer=tracer)
+
+# All timing methods work identically
+timings = tracer.get_node_timings()
+slowest = tracer.get_slowest_node()
+tracer.print_timing_table()
+```
+
+## 10. Performance Considerations
 
 Tracing is designed to be lightweight:
 
 - **Zero overhead when disabled**: If you don't pass a tracer, no tracing code runs
-- **Minimal overhead when enabled**: Only records event type, node name, and timestamp
+- **Minimal overhead when enabled**: Only records event type, node name, timestamp, and timing
 - **Optional data capture**: Full data capture is opt-in and can be controlled with `max_data_size`
 - **Node name caching**: Names are computed once and cached
+- **Automatic timing**: Phase timing is always captured with minimal overhead
 
 For production, you can:
 1. Disable tracing entirely (don't pass a tracer)
 2. Enable tracing only for specific flows you're debugging
 3. Use sampling to trace only a percentage of requests
 
-## 10. Complete Example
+## 11. Complete Example
 
 Here's a complete example showing tracing with branching and retries:
 
@@ -401,7 +575,7 @@ tracer.print_summary()
 
 This will output detailed information about the flow execution, including any retries that occurred and which branch was taken based on the data value.
 
-## 11. Combining with FlowStructure
+## 12. Combining with FlowStructure
 
 While `FlowTracer` shows what **did happen** during execution, `FlowStructure` shows what **can happen** before you run. Use them together for powerful debugging:
 

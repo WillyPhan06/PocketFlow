@@ -1,7 +1,10 @@
 import asyncio, warnings, copy, time, contextvars
 from dataclasses import dataclass, field
-from typing import Any, Optional, List, Dict, Set, Tuple
+from typing import Any, Optional, List, Dict, Set, Tuple, Literal
 from enum import Enum
+
+# Type alias for sort_by parameter in timing methods
+SortByPhase = Literal['total', 'prep', 'exec', 'post']
 
 class TraceEventType(Enum):
     NODE_START = "node_start"
@@ -27,6 +30,42 @@ class TraceEvent:
     def __repr__(self):
         data_str = f", data={self.data}" if self.data else ""
         return f"TraceEvent({self.event_type.value}, node={self.node_name}, t={self.timestamp:.4f}{data_str})"
+
+@dataclass
+class NodeTiming:
+    """Timing information for a single node execution.
+
+    This dataclass captures the duration of each phase (prep, exec, post) of node
+    execution, helping developers identify performance bottlenecks.
+
+    Attributes:
+        node_name: The name of the node.
+        prep_time: Time in seconds for the prep() phase. None if not recorded.
+        exec_time: Time in seconds for the exec() phase. None if not recorded.
+        post_time: Time in seconds for the post() phase. None if not recorded.
+        total_time: Total time from NODE_START to NODE_END in seconds. None if incomplete.
+        start_timestamp: Absolute timestamp when node started.
+        end_timestamp: Absolute timestamp when node ended. None if not yet ended.
+    """
+    node_name: str
+    prep_time: Optional[float] = None
+    exec_time: Optional[float] = None
+    post_time: Optional[float] = None
+    total_time: Optional[float] = None
+    start_timestamp: Optional[float] = None
+    end_timestamp: Optional[float] = None
+
+    def __repr__(self):
+        times = []
+        if self.prep_time is not None:
+            times.append(f"prep={self.prep_time:.4f}s")
+        if self.exec_time is not None:
+            times.append(f"exec={self.exec_time:.4f}s")
+        if self.post_time is not None:
+            times.append(f"post={self.post_time:.4f}s")
+        if self.total_time is not None:
+            times.append(f"total={self.total_time:.4f}s")
+        return f"NodeTiming({self.node_name}, {', '.join(times)})"
 
 @dataclass
 class NodeError:
@@ -95,8 +134,8 @@ class FlowTracer:
         if data and self.capture_data:
             captured_data = {k: self._truncate(v) for k, v in data.items()}
         elif data:
-            # Even without capture_data, record lightweight info like action names
-            captured_data = {k: v for k, v in data.items() if k in ('action', 'retry', 'max_retries', 'wait_time', 'error', 'from_node', 'to_node', 'type', 'retry_count')}
+            # Even without capture_data, record lightweight info like action names and timing
+            captured_data = {k: v for k, v in data.items() if k in ('action', 'retry', 'max_retries', 'wait_time', 'error', 'from_node', 'to_node', 'type', 'retry_count', 'prep_time', 'exec_time', 'post_time')}
             if not captured_data:
                 captured_data = None
 
@@ -126,6 +165,194 @@ class FlowTracer:
             return 0.0
         return self.events[-1].timestamp - self.events[0].timestamp
 
+    def get_node_timings(self) -> List[NodeTiming]:
+        """Get timing information for all executed nodes.
+
+        Calculates prep, exec, and post phase durations for each node by analyzing
+        the recorded trace events. Returns a list of NodeTiming objects with
+        detailed timing breakdowns.
+
+        Returns:
+            List of NodeTiming objects, one per node execution in order of execution.
+        """
+        timings = []
+        # Track timing data per node execution (same node can run multiple times)
+        node_data: Dict[str, Dict] = {}
+
+        for event in self.events:
+            name = event.node_name
+            if event.event_type == TraceEventType.NODE_START:
+                # Start a new timing record for this node execution
+                node_data[name] = {
+                    "start_timestamp": event.timestamp,
+                    "prep_time": None,
+                    "exec_time": None,
+                    "post_time": None,
+                    "end_timestamp": None
+                }
+            elif event.event_type == TraceEventType.NODE_PREP and name in node_data:
+                if event.data and "prep_time" in event.data:
+                    node_data[name]["prep_time"] = event.data["prep_time"]
+            elif event.event_type == TraceEventType.NODE_EXEC and name in node_data:
+                if event.data and "exec_time" in event.data:
+                    node_data[name]["exec_time"] = event.data["exec_time"]
+            elif event.event_type == TraceEventType.NODE_POST and name in node_data:
+                if event.data and "post_time" in event.data:
+                    node_data[name]["post_time"] = event.data["post_time"]
+            elif event.event_type == TraceEventType.NODE_END and name in node_data:
+                data = node_data.pop(name)
+                data["end_timestamp"] = event.timestamp
+                total_time = None
+                if data["start_timestamp"] is not None:
+                    total_time = data["end_timestamp"] - data["start_timestamp"]
+                timings.append(NodeTiming(
+                    node_name=name,
+                    prep_time=data["prep_time"],
+                    exec_time=data["exec_time"],
+                    post_time=data["post_time"],
+                    total_time=total_time,
+                    start_timestamp=data["start_timestamp"],
+                    end_timestamp=data["end_timestamp"]
+                ))
+
+        return timings
+
+    def _get_sort_key(self, sort_by: SortByPhase):
+        """Get the sorting key function for a given sort_by parameter.
+
+        Args:
+            sort_by: One of 'total', 'prep', 'exec', or 'post'.
+
+        Returns:
+            A function that extracts the timing value for sorting.
+
+        Raises:
+            ValueError: If sort_by is not a valid option.
+        """
+        sort_keys = {
+            'total': lambda t: t.total_time if t.total_time is not None else 0,
+            'prep': lambda t: t.prep_time if t.prep_time is not None else 0,
+            'exec': lambda t: t.exec_time if t.exec_time is not None else 0,
+            'post': lambda t: t.post_time if t.post_time is not None else 0,
+        }
+        if sort_by not in sort_keys:
+            raise ValueError(f"sort_by must be one of {list(sort_keys.keys())}, got '{sort_by}'")
+        return sort_keys[sort_by]
+
+    def get_slowest_nodes(self, n: Optional[int] = None, sort_by: SortByPhase = 'total') -> List[NodeTiming]:
+        """Get the slowest nodes sorted by the specified timing phase.
+
+        Useful for identifying multiple performance bottlenecks in your flow.
+        Returns nodes sorted from slowest to fastest.
+
+        Args:
+            n: Maximum number of nodes to return. None returns all nodes sorted.
+            sort_by: Which timing to sort by. One of:
+                - 'total': Total execution time (default)
+                - 'prep': Time spent in prep() phase
+                - 'exec': Time spent in exec() phase
+                - 'post': Time spent in post() phase
+
+        Returns:
+            List of NodeTiming objects sorted from slowest to fastest.
+
+        Raises:
+            ValueError: If sort_by is not a valid option.
+
+        Example:
+            # Get top 5 slowest nodes by total time
+            slowest = tracer.get_slowest_nodes(n=5)
+
+            # Get all nodes sorted by exec time (slowest first)
+            by_exec = tracer.get_slowest_nodes(sort_by='exec')
+
+            # Get top 3 slowest by prep time
+            slow_prep = tracer.get_slowest_nodes(n=3, sort_by='prep')
+        """
+        timings = self.get_node_timings()
+        if not timings:
+            return []
+
+        sort_key = self._get_sort_key(sort_by)
+        sorted_timings = sorted(timings, key=sort_key, reverse=True)
+
+        if n is not None:
+            return sorted_timings[:n]
+        return sorted_timings
+
+    def get_slowest_node(self, sort_by: SortByPhase = 'total') -> Optional[NodeTiming]:
+        """Get the timing info for the slowest node.
+
+        Useful for quickly identifying the main performance bottleneck in your flow.
+
+        Args:
+            sort_by: Which timing to use for finding the slowest node. One of:
+                - 'total': Total execution time (default)
+                - 'prep': Time spent in prep() phase
+                - 'exec': Time spent in exec() phase
+                - 'post': Time spent in post() phase
+
+        Returns:
+            NodeTiming for the slowest node, or None if no nodes were traced.
+
+        Raises:
+            ValueError: If sort_by is not a valid option.
+        """
+        slowest = self.get_slowest_nodes(n=1, sort_by=sort_by)
+        return slowest[0] if slowest else None
+
+    def print_timing_table(self):
+        """Print a formatted table showing timing for each node.
+
+        Displays node name, prep time, exec time, post time, and total time
+        in a tabular format. Also highlights the slowest node to help identify
+        performance bottlenecks.
+        """
+        timings = self.get_node_timings()
+        if not timings:
+            print("No timing data recorded.")
+            return
+
+        # Calculate column widths
+        name_width = max(len("Node"), max(len(t.node_name) for t in timings))
+        time_width = 12  # Format: "0.000000s" = 10 chars + padding
+
+        # Print header
+        print(f"\n{'='*70}")
+        print("NODE TIMING TABLE")
+        print(f"{'='*70}")
+        header = f"{'Node':<{name_width}} | {'Prep':>{time_width}} | {'Exec':>{time_width}} | {'Post':>{time_width}} | {'Total':>{time_width}}"
+        print(header)
+        print("-" * len(header))
+
+        # Find slowest for highlighting
+        slowest = self.get_slowest_node()
+        slowest_name = slowest.node_name if slowest else None
+
+        # Print each node's timing
+        for t in timings:
+            prep = f"{t.prep_time:.6f}s" if t.prep_time is not None else "-"
+            exec_t = f"{t.exec_time:.6f}s" if t.exec_time is not None else "-"
+            post = f"{t.post_time:.6f}s" if t.post_time is not None else "-"
+            total = f"{t.total_time:.6f}s" if t.total_time is not None else "-"
+            marker = " <-- SLOWEST" if t.node_name == slowest_name else ""
+            print(f"{t.node_name:<{name_width}} | {prep:>{time_width}} | {exec_t:>{time_width}} | {post:>{time_width}} | {total:>{time_width}}{marker}")
+
+        print(f"{'='*70}")
+
+        # Print summary
+        if slowest:
+            print(f"\nSlowest node: {slowest.node_name} ({slowest.total_time:.6f}s)")
+            if slowest.prep_time and slowest.exec_time and slowest.post_time:
+                phases = [
+                    ("prep", slowest.prep_time),
+                    ("exec", slowest.exec_time),
+                    ("post", slowest.post_time)
+                ]
+                slowest_phase = max(phases, key=lambda x: x[1])
+                print(f"Slowest phase: {slowest_phase[0]} ({slowest_phase[1]:.6f}s)")
+        print()
+
     def print_summary(self):
         """Print a human-readable summary of the execution trace."""
         if not self.events:
@@ -151,6 +378,23 @@ class FlowTracer:
             for r in retries:
                 print(f"  {r['node']}: attempt {r.get('retry', '?')}/{r.get('max_retries', '?')}")
 
+        # Node timing summary
+        timings = self.get_node_timings()
+        if timings:
+            print(f"\nNode timings:")
+            for t in timings:
+                total_str = f"{t.total_time:.4f}s" if t.total_time is not None else "?"
+                parts = []
+                if t.prep_time is not None: parts.append(f"prep={t.prep_time:.4f}s")
+                if t.exec_time is not None: parts.append(f"exec={t.exec_time:.4f}s")
+                if t.post_time is not None: parts.append(f"post={t.post_time:.4f}s")
+                detail = f" ({', '.join(parts)})" if parts else ""
+                print(f"  {t.node_name}: {total_str}{detail}")
+
+            slowest = self.get_slowest_node()
+            if slowest:
+                print(f"\n  Slowest: {slowest.node_name} ({slowest.total_time:.4f}s)")
+
         print(f"\nDetailed timeline:")
         for event in self.events:
             rel_time = event.timestamp - self.events[0].timestamp
@@ -160,11 +404,32 @@ class FlowTracer:
 
     def to_dict(self) -> Dict[str, Any]:
         """Export trace as a dictionary for serialization."""
+        timings = self.get_node_timings()
+        slowest = self.get_slowest_node()
         return {
             "duration": self.get_duration(),
             "execution_order": self.get_execution_order(),
             "transitions": self.get_transitions(),
             "retries": self.get_retries(),
+            "node_timings": [
+                {
+                    "node_name": t.node_name,
+                    "prep_time": t.prep_time,
+                    "exec_time": t.exec_time,
+                    "post_time": t.post_time,
+                    "total_time": t.total_time,
+                    "start_timestamp": t.start_timestamp,
+                    "end_timestamp": t.end_timestamp
+                }
+                for t in timings
+            ],
+            "slowest_node": {
+                "node_name": slowest.node_name,
+                "total_time": slowest.total_time,
+                "prep_time": slowest.prep_time,
+                "exec_time": slowest.exec_time,
+                "post_time": slowest.post_time
+            } if slowest else None,
             "events": [
                 {
                     "type": e.event_type.value,
@@ -774,12 +1039,30 @@ class BaseNode:
         # Returns (action, exec_result) tuple for orchestrator to handle error routing
         tracer = tracer or _get_current_tracer()
         node_name = _get_node_name(self) if tracer else None
+        # Prep phase with timing
+        prep_start = time.time()
         p = self.prep(shared)
-        if tracer: tracer.record(TraceEventType.NODE_PREP, node_name, {"prep_result": p} if tracer.capture_data else None)
+        prep_end = time.time()
+        if tracer:
+            data = {"prep_time": prep_end - prep_start}
+            if tracer.capture_data: data["prep_result"] = p
+            tracer.record(TraceEventType.NODE_PREP, node_name, data)
+        # Exec phase with timing
+        exec_start = time.time()
         e = self._exec(p, tracer)
-        if tracer: tracer.record(TraceEventType.NODE_EXEC, node_name, {"exec_result": e} if tracer.capture_data else None)
+        exec_end = time.time()
+        if tracer:
+            data = {"exec_time": exec_end - exec_start}
+            if tracer.capture_data: data["exec_result"] = e
+            tracer.record(TraceEventType.NODE_EXEC, node_name, data)
+        # Post phase with timing
+        post_start = time.time()
         action = self.post(shared, p, e)
-        if tracer: tracer.record(TraceEventType.NODE_POST, node_name, {"action": action} if action else None)
+        post_end = time.time()
+        if tracer:
+            data = {"post_time": post_end - post_start}
+            if action: data["action"] = action
+            tracer.record(TraceEventType.NODE_POST, node_name, data)
         return (action, e)  # Return tuple: (action from post, exec result)
     def run(self,shared,tracer=None):
         if self.successors: warnings.warn("Node won't run successors. Use Flow.")
@@ -998,12 +1281,30 @@ class AsyncNode(Node):
         # Returns (action, exec_result) tuple for orchestrator to handle error routing
         tracer = tracer or _get_current_tracer()
         node_name = _get_node_name(self) if tracer else None
+        # Prep phase with timing
+        prep_start = time.time()
         p=await self.prep_async(shared)
-        if tracer: tracer.record(TraceEventType.NODE_PREP, node_name, {"prep_result": p} if tracer.capture_data else None)
+        prep_end = time.time()
+        if tracer:
+            data = {"prep_time": prep_end - prep_start}
+            if tracer.capture_data: data["prep_result"] = p
+            tracer.record(TraceEventType.NODE_PREP, node_name, data)
+        # Exec phase with timing
+        exec_start = time.time()
         e=await self._exec(p,tracer)
-        if tracer: tracer.record(TraceEventType.NODE_EXEC, node_name, {"exec_result": e} if tracer.capture_data else None)
+        exec_end = time.time()
+        if tracer:
+            data = {"exec_time": exec_end - exec_start}
+            if tracer.capture_data: data["exec_result"] = e
+            tracer.record(TraceEventType.NODE_EXEC, node_name, data)
+        # Post phase with timing
+        post_start = time.time()
         action=await self.post_async(shared,p,e)
-        if tracer: tracer.record(TraceEventType.NODE_POST, node_name, {"action": action} if action else None)
+        post_end = time.time()
+        if tracer:
+            data = {"post_time": post_end - post_start}
+            if action: data["action"] = action
+            tracer.record(TraceEventType.NODE_POST, node_name, data)
         return (action, e)  # Return tuple: (action from post, exec result)
     def _run(self,shared,tracer=None): raise RuntimeError("Use run_async.")
 
